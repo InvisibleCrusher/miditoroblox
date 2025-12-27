@@ -1,0 +1,9 @@
+[package]
+name = "miditoroblox_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+evdev = "0.13.2"
+eframe = "0.31"
+midir = "0.10"
