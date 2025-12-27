@@ -1,4 +1,10 @@
-# MIDI to Roblox
+# WARNING!!!
+
+This program automates keyboard inputs, which can lead to unexpected behavior like opening programs or clicking things while it recieves MIDI signals and you have another program focused!!!
+
+This program also works only on Linux, and if it doesn't work you might have to run it with sudo.
+
+## MIDI to Roblox
 
 This Rust Program maps MIDI notes to Roblox keys. It uses /dev/uinput to create a virtual keyboard and uses it to play the notes from a MIDI signal. It features a simple GUI to control the program.
 
