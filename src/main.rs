@@ -2,8 +2,9 @@ use eframe::egui;
 use evdev::{uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{thread, time};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{self, SystemTime, UNIX_EPOCH};
+use std::thread;
 
 struct KeyMapping {
     midi_note: u8,
@@ -14,6 +15,8 @@ struct KeyMapping {
 
 struct DeviceState {
     device: VirtualDevice,
+    ctrl_count: usize,
+    current_transpose_offset: i32,
 }
 
 struct SharedState {
@@ -23,20 +26,28 @@ struct SharedState {
     high_mapping_enabled: AtomicBool,
     auto_transpose_enabled: AtomicBool,
     experimental_transpose_enabled: AtomicBool,
+    experimental_hold_ctrl_enabled: AtomicBool,
+    transpose_delay_ms: AtomicU64,
+    lazy_transpose_enabled: AtomicBool,
+    quantize_enabled: AtomicBool,
+    quantize_ms: AtomicU64,
 }
 
 fn get_mappings() -> Vec<KeyMapping> {
     vec![
-        // --- Low Range (C1 to B1) - [CTRL] ---
-        KeyMapping { midi_note: 24, key_code: KeyCode::KEY_1, shift: false, ctrl: true }, // C1  -> 1
-        KeyMapping { midi_note: 25, key_code: KeyCode::KEY_2, shift: false, ctrl: true }, // C#1 -> 2
-        KeyMapping { midi_note: 26, key_code: KeyCode::KEY_3, shift: false, ctrl: true }, // D1  -> 3
-        KeyMapping { midi_note: 27, key_code: KeyCode::KEY_4, shift: false, ctrl: true }, // D#1 -> 4
-        KeyMapping { midi_note: 28, key_code: KeyCode::KEY_5, shift: false, ctrl: true }, // E1  -> 5
-        KeyMapping { midi_note: 29, key_code: KeyCode::KEY_6, shift: false, ctrl: true }, // F1  -> 6
-        KeyMapping { midi_note: 30, key_code: KeyCode::KEY_7, shift: false, ctrl: true }, // F#1 -> 7
-        KeyMapping { midi_note: 31, key_code: KeyCode::KEY_8, shift: false, ctrl: true }, // G1  -> 8
-        KeyMapping { midi_note: 32, key_code: KeyCode::KEY_9, shift: false, ctrl: true }, // G#1 -> 9
+        // --- Low Range (A0 to B1) - [CTRL] ---
+        KeyMapping { midi_note: 21, key_code: KeyCode::KEY_1, shift: false, ctrl: true }, // A0  -> 1
+        KeyMapping { midi_note: 22, key_code: KeyCode::KEY_2, shift: false, ctrl: true }, // A#0 -> 2
+        KeyMapping { midi_note: 23, key_code: KeyCode::KEY_3, shift: false, ctrl: true }, // B0  -> 3
+        KeyMapping { midi_note: 24, key_code: KeyCode::KEY_4, shift: false, ctrl: true }, // C1  -> 4
+        KeyMapping { midi_note: 25, key_code: KeyCode::KEY_5, shift: false, ctrl: true }, // C#1 -> 5
+        KeyMapping { midi_note: 26, key_code: KeyCode::KEY_6, shift: false, ctrl: true }, // D1  -> 6
+        KeyMapping { midi_note: 27, key_code: KeyCode::KEY_7, shift: false, ctrl: true }, // D#1 -> 7
+        KeyMapping { midi_note: 28, key_code: KeyCode::KEY_8, shift: false, ctrl: true }, // E1  -> 8
+        KeyMapping { midi_note: 29, key_code: KeyCode::KEY_9, shift: false, ctrl: true }, // F1  -> 9
+        KeyMapping { midi_note: 30, key_code: KeyCode::KEY_0, shift: false, ctrl: true }, // F#1 -> 0
+        KeyMapping { midi_note: 31, key_code: KeyCode::KEY_Q, shift: false, ctrl: true }, // G1  -> q
+        KeyMapping { midi_note: 32, key_code: KeyCode::KEY_W, shift: false, ctrl: true }, // G#1 -> w
         KeyMapping { midi_note: 33, key_code: KeyCode::KEY_E, shift: false, ctrl: true }, // A1  -> e
         KeyMapping { midi_note: 34, key_code: KeyCode::KEY_R, shift: false, ctrl: true }, // A#1 -> r
         KeyMapping { midi_note: 35, key_code: KeyCode::KEY_T, shift: false, ctrl: true }, // B1  -> t
@@ -144,12 +155,19 @@ impl MidiApp {
             shared_state: Arc::new(SharedState {
                 device_state: Mutex::new(DeviceState {
                     device: virtual_device,
+                    ctrl_count: 0,
+                    current_transpose_offset: 0,
                 }),
                 base_mapping_enabled: AtomicBool::new(false),
                 low_mapping_enabled: AtomicBool::new(false),
                 high_mapping_enabled: AtomicBool::new(false),
                 auto_transpose_enabled: AtomicBool::new(false),
                 experimental_transpose_enabled: AtomicBool::new(false),
+                experimental_hold_ctrl_enabled: AtomicBool::new(false),
+                transpose_delay_ms: AtomicU64::new(0),
+                lazy_transpose_enabled: AtomicBool::new(false),
+                quantize_enabled: AtomicBool::new(false),
+                quantize_ms: AtomicU64::new(100),
             }),
             status_message: "Ready".to_string(),
         };
@@ -238,7 +256,7 @@ impl eframe::App for MidiApp {
                 }
                 
                 let mut low_enabled = self.shared_state.low_mapping_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut low_enabled, "Enable Low Range (C1-C#1...)").changed() {
+                if ui.checkbox(&mut low_enabled, "Enable Low Range (A0-B1)").changed() {
                     self.shared_state.low_mapping_enabled.store(low_enabled, Ordering::Relaxed);
                 }
                 
@@ -255,6 +273,41 @@ impl eframe::App for MidiApp {
                 let mut experimental_transpose = self.shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
                 if ui.checkbox(&mut experimental_transpose, "Experimental: Transpose Method for Black Keys").changed() {
                     self.shared_state.experimental_transpose_enabled.store(experimental_transpose, Ordering::Relaxed);
+                }
+
+
+
+                if experimental_transpose {
+                     let mut delay = self.shared_state.transpose_delay_ms.load(Ordering::Relaxed);
+                     if ui.add(egui::Slider::new(&mut delay, 0..=200).text("Transpose Delay (ms)")).changed() {
+                         self.shared_state.transpose_delay_ms.store(delay, Ordering::Relaxed);
+                     }
+                     
+                     let mut lazy = self.shared_state.lazy_transpose_enabled.load(Ordering::Relaxed);
+                     if ui.checkbox(&mut lazy, "Enable Lazy Optimization (Reduce Key Presses)").changed() {
+                         self.shared_state.lazy_transpose_enabled.store(lazy, Ordering::Relaxed);
+                     }
+                     
+                     if lazy {
+                         ui.label(egui::RichText::new("⚠️ Ensure in-game transposition is 0 before starting!").color(egui::Color32::YELLOW));
+                     }
+                }
+
+                let mut hold_ctrl = self.shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
+                if ui.checkbox(&mut hold_ctrl, "Experimental: Hold Notes for Low/High Range (Ctrl)").changed() {
+                    self.shared_state.experimental_hold_ctrl_enabled.store(hold_ctrl, Ordering::Relaxed);
+                }
+                
+                ui.separator();
+                let mut quantize = self.shared_state.quantize_enabled.load(Ordering::Relaxed);
+                if ui.checkbox(&mut quantize, "Enable Note Quantization (Grid Snap)").changed() {
+                    self.shared_state.quantize_enabled.store(quantize, Ordering::Relaxed);
+                }
+                if quantize {
+                     let mut q_ms = self.shared_state.quantize_ms.load(Ordering::Relaxed);
+                     if ui.add(egui::Slider::new(&mut q_ms, 10..=1000).text("Grid Size (ms)")).changed() {
+                         self.shared_state.quantize_ms.store(q_ms, Ordering::Relaxed);
+                     }
                 }
 
                 if ui.button("Disconnect").clicked() {
@@ -317,7 +370,7 @@ impl eframe::App for MidiApp {
                                          } else {
                                               // Try moving down
                                               let mut test_note = final_note;
-                                              while test_note >= 24 && !is_note_valid(test_note) {
+                                              while test_note >= 21 && !is_note_valid(test_note) {
                                                   if let Some(prev) = test_note.checked_sub(12) {
                                                       test_note = prev;
                                                   } else { break; }
@@ -334,6 +387,7 @@ impl eframe::App for MidiApp {
                                      }
                                      
                                      let use_experimental_transpose = shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
+                                     let use_hold_ctrl = shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
 
                                      let mappings = get_mappings();
                                      if let Some(mapping) = mappings.iter().find(|m| m.midi_note == final_note) {
@@ -344,24 +398,117 @@ impl eframe::App for MidiApp {
                                          
                                          // Note On (and velocity > 0)
                                          if status == 0x90 && velocity > 0 {
+                                             if shared_state.quantize_enabled.load(Ordering::Relaxed) {
+                                                  let grid = shared_state.quantize_ms.load(Ordering::Relaxed);
+                                                  if grid > 0 {
+                                                      if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                                                           let now_ms = duration.as_millis() as u64;
+                                                           let rem = now_ms % grid;
+                                                           if rem > 0 {
+                                                               let wait_ms = grid - rem;
+                                                               drop(state);
+                                                               thread::sleep(time::Duration::from_millis(wait_ms));
+                                                               state = shared_state.device_state.lock().unwrap();
+                                                           }
+                                                      }
+                                                  }
+                                              }
+                                             
+                                             
+                                             // --- Exact State Tracking / Lazy Transposition OR Naive ---
+                                             let mut handled_transpose = false;
+                                             
+                                             if use_experimental_transpose {
+                                                 let use_lazy = shared_state.lazy_transpose_enabled.load(Ordering::Relaxed);
+                                                 
+                                                 if use_lazy {
+                                                     // Lazy Mode
+                                                     let target_offset = if mapping_shift && !mapping_ctrl { 1 } else { 0 };
+                                                     let current_offset = state.current_transpose_offset;
+
+                                                     if target_offset != current_offset {
+                                                         let delay_ms = shared_state.transpose_delay_ms.load(Ordering::Relaxed);
+                                                         
+                                                         // We need to move
+                                                         if target_offset > current_offset {
+                                                             // Need invalid +1 (Assuming we only go 0 <-> 1)
+                                                             // Tap UP
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
+                                                         } else {
+                                                             // Need -1
+                                                             // Tap DOWN
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
+                                                         }
+
+                                                         if delay_ms > 0 {
+                                                             drop(state);
+                                                             thread::sleep(time::Duration::from_millis(delay_ms));
+                                                             state = shared_state.device_state.lock().unwrap();
+                                                         }
+                                                         
+                                                         state.current_transpose_offset = target_offset;
+                                                     }
+                                                     handled_transpose = true;
+                                                     
+                                                 } else {
+                                                     // Naive Mode (Up -> Note -> Down)
+                                                     // We handle this inside boolean logic below only for Shift notes
+                                                     // But we must reset state tracker just in case user switched modes mid-stream
+                                                     state.current_transpose_offset = 0; 
+                                                 }
+                                             }
+
+
                                              if mapping_ctrl {
-                                                 // Ctrl Key: Atomic Ctrl Tap
-                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
-                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
-                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
-                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                                 if use_hold_ctrl {
+                                                     // Experimental Hold Mode: Tap Ctrl, Hold Key
+                                                     // 1. Press Ctrl
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
+                                                     // 2. Press Note (Hold)
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
+                                                     // 3. Release Ctrl
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                                 } else {
+                                                     // Ctrl Key: Atomic Ctrl Tap (Original)
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                                 }
                                              } else if mapping_shift {
                                                  if use_experimental_transpose {
-                                                     // Experimental Transpose Method
-                                                     // 1. Up Arrow Tap (Transpose +1)
-                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
-                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
-                                                     // 2. Key Down (Hold)
-                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
-                                                     // 3. Down Arrow Tap (Transpose -1 aka Back to 0)
-                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
-                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
-                                                     
+                                                     if handled_transpose {
+                                                         // Lazy Mode: State is set, just press key
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
+                                                     } else {
+                                                         // Naive Mode: Up -> Note -> Down
+                                                         let delay_ms = shared_state.transpose_delay_ms.load(Ordering::Relaxed);
+                                                         
+                                                         // 1. Up
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
+                                                         
+                                                         if delay_ms > 0 {
+                                                             drop(state);
+                                                             thread::sleep(time::Duration::from_millis(delay_ms));
+                                                             state = shared_state.device_state.lock().unwrap();
+                                                         }
+                                                         
+                                                         // 2. Note
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
+
+                                                         if delay_ms > 0 {
+                                                             drop(state);
+                                                             thread::sleep(time::Duration::from_millis(delay_ms));
+                                                             state = shared_state.device_state.lock().unwrap();
+                                                         }
+                                                         
+                                                         // 3. Down
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
+                                                     }
                                                  } else {
                                                      // Default: Atomic Shift Tap
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 1)]);
@@ -376,14 +523,17 @@ impl eframe::App for MidiApp {
                                          }
                                          // Note Off or Note On with velocity 0
                                          else if status == 0x80 || (status == 0x90 && velocity == 0) {
-                                              if mapping_shift && use_experimental_transpose {
+                                              if mapping_ctrl && use_hold_ctrl {
+                                                  // Release Mode for Ctrl: Just release the key
+                                                  let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
+                                              } else if mapping_shift && use_experimental_transpose {
                                                   // Release logic for experimental mode: Stop Holding Key
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                               } else if !mapping_shift && !mapping_ctrl {
                                                   // White Key: Normal Release
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                               }
-                                              // Standard Black/Ctrl keys are auto-released on NoteOn, so ignore NoteOff
+                                              // Standard Black/Ctrl keys (in non-hold mode) are auto-released on NoteOn, so ignore NoteOff
                                          }
                                      }
 
