@@ -6,17 +6,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{self, SystemTime, UNIX_EPOCH};
 use std::thread;
 
-struct KeyMapping {
-    midi_note: u8,
-    key_code: KeyCode,
-    shift: bool,
-    ctrl: bool,
-}
+mod solver;
+use solver::{Solver, SolverMode};
+
+// Mappings moved to solver.rs
+
 
 struct DeviceState {
     device: VirtualDevice,
     ctrl_count: usize,
     current_transpose_offset: i32,
+    solver: Solver,
 }
 
 struct SharedState {
@@ -31,111 +31,12 @@ struct SharedState {
     lazy_transpose_enabled: AtomicBool,
     quantize_enabled: AtomicBool,
     quantize_ms: AtomicU64,
+    // Solver Settings
+    solver_enabled: AtomicBool,
+    solver_mode_efficiency: AtomicBool, // true = Efficiency, false = Accuracy
+    solver_max_jump: AtomicU64,
+    transpose_range: AtomicU64, // e.g. 24
 }
-
-fn get_mappings() -> Vec<KeyMapping> {
-    vec![
-        // --- Low Range (A0 to B1) - [CTRL] ---
-        KeyMapping { midi_note: 21, key_code: KeyCode::KEY_1, shift: false, ctrl: true }, // A0  -> 1
-        KeyMapping { midi_note: 22, key_code: KeyCode::KEY_2, shift: false, ctrl: true }, // A#0 -> 2
-        KeyMapping { midi_note: 23, key_code: KeyCode::KEY_3, shift: false, ctrl: true }, // B0  -> 3
-        KeyMapping { midi_note: 24, key_code: KeyCode::KEY_4, shift: false, ctrl: true }, // C1  -> 4
-        KeyMapping { midi_note: 25, key_code: KeyCode::KEY_5, shift: false, ctrl: true }, // C#1 -> 5
-        KeyMapping { midi_note: 26, key_code: KeyCode::KEY_6, shift: false, ctrl: true }, // D1  -> 6
-        KeyMapping { midi_note: 27, key_code: KeyCode::KEY_7, shift: false, ctrl: true }, // D#1 -> 7
-        KeyMapping { midi_note: 28, key_code: KeyCode::KEY_8, shift: false, ctrl: true }, // E1  -> 8
-        KeyMapping { midi_note: 29, key_code: KeyCode::KEY_9, shift: false, ctrl: true }, // F1  -> 9
-        KeyMapping { midi_note: 30, key_code: KeyCode::KEY_0, shift: false, ctrl: true }, // F#1 -> 0
-        KeyMapping { midi_note: 31, key_code: KeyCode::KEY_Q, shift: false, ctrl: true }, // G1  -> q
-        KeyMapping { midi_note: 32, key_code: KeyCode::KEY_W, shift: false, ctrl: true }, // G#1 -> w
-        KeyMapping { midi_note: 33, key_code: KeyCode::KEY_E, shift: false, ctrl: true }, // A1  -> e
-        KeyMapping { midi_note: 34, key_code: KeyCode::KEY_R, shift: false, ctrl: true }, // A#1 -> r
-        KeyMapping { midi_note: 35, key_code: KeyCode::KEY_T, shift: false, ctrl: true }, // B1  -> t
-
-        // --- Lower Octaves (C2 to B3) ---
-        KeyMapping { midi_note: 36, key_code: KeyCode::KEY_1, shift: false, ctrl: false }, // C2
-        KeyMapping { midi_note: 37, key_code: KeyCode::KEY_1, shift: true,  ctrl: false }, // C#2 -> !
-        KeyMapping { midi_note: 38, key_code: KeyCode::KEY_2, shift: false, ctrl: false }, // D2
-        KeyMapping { midi_note: 39, key_code: KeyCode::KEY_2, shift: true,  ctrl: false }, // D#2 -> @
-        KeyMapping { midi_note: 40, key_code: KeyCode::KEY_3, shift: false, ctrl: false }, // E2
-        KeyMapping { midi_note: 41, key_code: KeyCode::KEY_4, shift: false, ctrl: false }, // F2
-        KeyMapping { midi_note: 42, key_code: KeyCode::KEY_4, shift: true,  ctrl: false }, // F#2 -> $
-        KeyMapping { midi_note: 43, key_code: KeyCode::KEY_5, shift: false, ctrl: false }, // G2
-        KeyMapping { midi_note: 44, key_code: KeyCode::KEY_5, shift: true,  ctrl: false }, // G#2 -> %
-        KeyMapping { midi_note: 45, key_code: KeyCode::KEY_6, shift: false, ctrl: false }, // A2
-        KeyMapping { midi_note: 46, key_code: KeyCode::KEY_6, shift: true,  ctrl: false }, // A#2 -> ^
-        KeyMapping { midi_note: 47, key_code: KeyCode::KEY_7, shift: false, ctrl: false }, // B2
-        KeyMapping { midi_note: 48, key_code: KeyCode::KEY_8, shift: false, ctrl: false }, // C3
-        KeyMapping { midi_note: 49, key_code: KeyCode::KEY_8, shift: true,  ctrl: false }, // C#3 -> *
-        KeyMapping { midi_note: 50, key_code: KeyCode::KEY_9, shift: false, ctrl: false }, // D3
-        KeyMapping { midi_note: 51, key_code: KeyCode::KEY_9, shift: true,  ctrl: false }, // D#3 -> (
-        KeyMapping { midi_note: 52, key_code: KeyCode::KEY_0, shift: false, ctrl: false }, // E3
-        KeyMapping { midi_note: 53, key_code: KeyCode::KEY_Q, shift: false, ctrl: false }, // F3
-        KeyMapping { midi_note: 54, key_code: KeyCode::KEY_Q, shift: true,  ctrl: false }, // F#3 -> Q
-        KeyMapping { midi_note: 55, key_code: KeyCode::KEY_W, shift: false, ctrl: false }, // G3
-        KeyMapping { midi_note: 56, key_code: KeyCode::KEY_W, shift: true,  ctrl: false }, // G#3 -> W
-        KeyMapping { midi_note: 57, key_code: KeyCode::KEY_E, shift: false, ctrl: false }, // A3
-        KeyMapping { midi_note: 58, key_code: KeyCode::KEY_E, shift: true,  ctrl: false }, // A#3 -> E
-        KeyMapping { midi_note: 59, key_code: KeyCode::KEY_R, shift: false, ctrl: false }, // B3
-
-        // --- Middle Octaves (C4 to C6) ---
-        KeyMapping { midi_note: 60, key_code: KeyCode::KEY_T, shift: false, ctrl: false }, // C4
-        KeyMapping { midi_note: 61, key_code: KeyCode::KEY_T, shift: true,  ctrl: false }, // C#4 -> T
-        KeyMapping { midi_note: 62, key_code: KeyCode::KEY_Y, shift: false, ctrl: false }, // D4
-        KeyMapping { midi_note: 63, key_code: KeyCode::KEY_Y, shift: true,  ctrl: false }, // D#4 -> Y
-        KeyMapping { midi_note: 64, key_code: KeyCode::KEY_U, shift: false, ctrl: false }, // E4
-        KeyMapping { midi_note: 65, key_code: KeyCode::KEY_I, shift: false, ctrl: false }, // F4
-        KeyMapping { midi_note: 66, key_code: KeyCode::KEY_I, shift: true,  ctrl: false }, // F#4 -> I
-        KeyMapping { midi_note: 67, key_code: KeyCode::KEY_O, shift: false, ctrl: false }, // G4
-        KeyMapping { midi_note: 68, key_code: KeyCode::KEY_O, shift: true,  ctrl: false }, // G#4 -> O
-        KeyMapping { midi_note: 69, key_code: KeyCode::KEY_P, shift: false, ctrl: false }, // A4
-        KeyMapping { midi_note: 70, key_code: KeyCode::KEY_P, shift: true,  ctrl: false }, // A#4 -> P
-        KeyMapping { midi_note: 71, key_code: KeyCode::KEY_A, shift: false, ctrl: false }, // B4
-        KeyMapping { midi_note: 72, key_code: KeyCode::KEY_S, shift: false, ctrl: false }, // C5
-        KeyMapping { midi_note: 73, key_code: KeyCode::KEY_S, shift: true,  ctrl: false }, // C#5 -> S
-        KeyMapping { midi_note: 74, key_code: KeyCode::KEY_D, shift: false, ctrl: false }, // D5
-        KeyMapping { midi_note: 75, key_code: KeyCode::KEY_D, shift: true,  ctrl: false }, // D#5 -> D
-        KeyMapping { midi_note: 76, key_code: KeyCode::KEY_F, shift: false, ctrl: false }, // E5
-        KeyMapping { midi_note: 77, key_code: KeyCode::KEY_G, shift: false, ctrl: false }, // F5
-        KeyMapping { midi_note: 78, key_code: KeyCode::KEY_G, shift: true,  ctrl: false }, // F#5 -> G
-        KeyMapping { midi_note: 79, key_code: KeyCode::KEY_H, shift: false, ctrl: false }, // G5
-        KeyMapping { midi_note: 80, key_code: KeyCode::KEY_H, shift: true,  ctrl: false }, // G#5 -> H
-        KeyMapping { midi_note: 81, key_code: KeyCode::KEY_J, shift: false, ctrl: false }, // A5
-        KeyMapping { midi_note: 82, key_code: KeyCode::KEY_J, shift: true,  ctrl: false }, // A#5 -> J
-        KeyMapping { midi_note: 83, key_code: KeyCode::KEY_K, shift: false, ctrl: false }, // B5
-        KeyMapping { midi_note: 84, key_code: KeyCode::KEY_L, shift: false, ctrl: false }, // C6
-        KeyMapping { midi_note: 85, key_code: KeyCode::KEY_L, shift: true,  ctrl: false }, // C#6 -> L
-
-        // --- High Octaves (D6 to C7) ---
-        KeyMapping { midi_note: 86, key_code: KeyCode::KEY_Z, shift: false, ctrl: false }, // D6
-        KeyMapping { midi_note: 87, key_code: KeyCode::KEY_Z, shift: true,  ctrl: false }, // D#6 -> Z
-        KeyMapping { midi_note: 88, key_code: KeyCode::KEY_X, shift: false, ctrl: false }, // E6
-        KeyMapping { midi_note: 89, key_code: KeyCode::KEY_C, shift: false, ctrl: false }, // F6
-        KeyMapping { midi_note: 90, key_code: KeyCode::KEY_C, shift: true,  ctrl: false }, // F#6 -> C
-        KeyMapping { midi_note: 91, key_code: KeyCode::KEY_V, shift: false, ctrl: false }, // G6
-        KeyMapping { midi_note: 92, key_code: KeyCode::KEY_V, shift: true,  ctrl: false }, // G#6 -> V
-        KeyMapping { midi_note: 93, key_code: KeyCode::KEY_B, shift: false, ctrl: false }, // A6
-        KeyMapping { midi_note: 94, key_code: KeyCode::KEY_B, shift: true,  ctrl: false }, // A#6 -> B
-        KeyMapping { midi_note: 95, key_code: KeyCode::KEY_N, shift: false, ctrl: false }, // B6
-        KeyMapping { midi_note: 96, key_code: KeyCode::KEY_M, shift: false, ctrl: false }, // C7
-
-        // --- High Range (C#7 to C8) - [CTRL] ---
-        KeyMapping { midi_note: 97,  key_code: KeyCode::KEY_Y, shift: false, ctrl: true }, // C#7 -> y
-        KeyMapping { midi_note: 98,  key_code: KeyCode::KEY_U, shift: false, ctrl: true }, // D7  -> u
-        KeyMapping { midi_note: 99,  key_code: KeyCode::KEY_I, shift: false, ctrl: true }, // D#7 -> i
-        KeyMapping { midi_note: 100, key_code: KeyCode::KEY_O, shift: false, ctrl: true }, // E7  -> o
-        KeyMapping { midi_note: 101, key_code: KeyCode::KEY_P, shift: false, ctrl: true }, // F7  -> p
-        KeyMapping { midi_note: 102, key_code: KeyCode::KEY_A, shift: false, ctrl: true }, // F#7 -> a
-        KeyMapping { midi_note: 103, key_code: KeyCode::KEY_S, shift: false, ctrl: true }, // G7  -> s
-        KeyMapping { midi_note: 104, key_code: KeyCode::KEY_D, shift: false, ctrl: true }, // G#7 -> d
-        KeyMapping { midi_note: 105, key_code: KeyCode::KEY_F, shift: false, ctrl: true }, // A7  -> f
-        KeyMapping { midi_note: 106, key_code: KeyCode::KEY_G, shift: false, ctrl: true }, // A#7 -> g
-        KeyMapping { midi_note: 107, key_code: KeyCode::KEY_H, shift: false, ctrl: true }, // B7  -> h
-        KeyMapping { midi_note: 108, key_code: KeyCode::KEY_J, shift: false, ctrl: true }, // C8  -> j
-    ]
-}
-
-
 struct MidiApp {
     midi_input: Option<MidiInput>,
     available_ports: Vec<(String, MidiInputPort)>,
@@ -143,10 +44,13 @@ struct MidiApp {
     connection: Option<MidiInputConnection<Arc<SharedState>>>,
     shared_state: Arc<SharedState>,
     status_message: String,
+    // Window Settings
+    window_opacity: f32,
+    always_on_top: bool,
 }
 
 impl MidiApp {
-    fn new(_cc: &eframe::CreationContext<'_>, virtual_device: VirtualDevice) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, virtual_device: VirtualDevice) -> Self {
         let mut app = Self {
             midi_input: Some(MidiInput::new("Miditoroblox Input").unwrap()),
             available_ports: Vec::new(),
@@ -157,6 +61,7 @@ impl MidiApp {
                     device: virtual_device,
                     ctrl_count: 0,
                     current_transpose_offset: 0,
+                    solver: Solver::new(),
                 }),
                 base_mapping_enabled: AtomicBool::new(false),
                 low_mapping_enabled: AtomicBool::new(false),
@@ -168,9 +73,22 @@ impl MidiApp {
                 lazy_transpose_enabled: AtomicBool::new(false),
                 quantize_enabled: AtomicBool::new(false),
                 quantize_ms: AtomicU64::new(100),
+                solver_enabled: AtomicBool::new(false),
+                solver_mode_efficiency: AtomicBool::new(true),
+                solver_max_jump: AtomicU64::new(10), // Default 10 semitones jump limit
+                transpose_range: AtomicU64::new(24),
             }),
             status_message: "Ready".to_string(),
+            window_opacity: 1.0,
+            always_on_top: false,
         };
+        
+        // Initialize visuals (opaque default)
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = egui::Color32::from_black_alpha(255);
+        visuals.panel_fill = egui::Color32::from_black_alpha(255);
+        cc.egui_ctx.set_visuals(visuals);
+
         app.refresh_ports();
         app
     }
@@ -309,6 +227,57 @@ impl eframe::App for MidiApp {
                          self.shared_state.quantize_ms.store(q_ms, Ordering::Relaxed);
                      }
                 }
+                
+                ui.separator();
+                ui.heading("Smart Solver");
+                let mut solver_on = self.shared_state.solver_enabled.load(Ordering::Relaxed);
+                if ui.checkbox(&mut solver_on, "Enable Smart Solver (Experimental)").changed() {
+                    self.shared_state.solver_enabled.store(solver_on, Ordering::Relaxed);
+                }
+                
+                if solver_on {
+                    ui.label(egui::RichText::new("⚠️ IMPORTANT: Ensure in-game transposition is 0 before starting!").color(egui::Color32::RED));
+                    
+                    let mut is_efficiency = self.shared_state.solver_mode_efficiency.load(Ordering::Relaxed);
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut is_efficiency, true, "Efficiency (Least Clicks)");
+                        ui.radio_value(&mut is_efficiency, false, "Accuracy (Best Match)");
+                    });
+                     if is_efficiency != self.shared_state.solver_mode_efficiency.load(Ordering::Relaxed) {
+                        self.shared_state.solver_mode_efficiency.store(is_efficiency, Ordering::Relaxed);
+                    }
+                    
+                    if is_efficiency {
+                         let mut max_jump = self.shared_state.solver_max_jump.load(Ordering::Relaxed);
+                         if ui.add(egui::Slider::new(&mut max_jump, 1..=24).text("Max Jump Distance")).changed() {
+                             self.shared_state.solver_max_jump.store(max_jump, Ordering::Relaxed);
+                         }
+                    }
+                    
+                    let mut range = self.shared_state.transpose_range.load(Ordering::Relaxed);
+                    if ui.add(egui::Slider::new(&mut range, 12..=36).text("Transposition Range (+/-)")).changed() {
+                        self.shared_state.transpose_range.store(range, Ordering::Relaxed);
+                    }
+                    
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset Solver Transpose (0)").clicked() {
+                            let mut state = self.shared_state.device_state.lock().unwrap();
+                            state.solver.reset_transpose();
+                            state.current_transpose_offset = 0; // Sync
+                        }
+                        if ui.button("Panic: Release All Keys").clicked() {
+                            let mut state = self.shared_state.device_state.lock().unwrap();
+                            let keys = state.solver.reset_keys();
+                            for k in keys {
+                                let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, k.code(), 0)]);
+                            }
+                            // Also ensure modifiers are down
+                            let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
+                            let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                        }
+                    });
+                }
 
                 if ui.button("Disconnect").clicked() {
                     self.connection = None;
@@ -355,41 +324,155 @@ impl eframe::App for MidiApp {
                                      let mut final_note = note_original;
                                      let mut valid = is_note_valid(final_note);
                                      
-                                     // Auto-transpose logic
-                                     if !valid && shared_state.auto_transpose_enabled.load(Ordering::Relaxed) {
-                                         // If note is too low, move up
-                                         let mut test_note = final_note;
-                                         while test_note <= 108 && !is_note_valid(test_note) {
-                                              if let Some(next) = test_note.checked_add(12) {
-                                                  test_note = next;
-                                              } else { break; }
-                                         }
-                                         if is_note_valid(test_note) {
-                                             final_note = test_note;
-                                             valid = true;
-                                         } else {
-                                              // Try moving down
+                                     // Auto-transpose logic if solver is NOT enabled (legacy behavior)
+                                     let use_solver = shared_state.solver_enabled.load(Ordering::Relaxed);
+
+                                     if !use_solver {
+                                          if !valid && shared_state.auto_transpose_enabled.load(Ordering::Relaxed) {
+                                              // If note is too low, move up
                                               let mut test_note = final_note;
-                                              while test_note >= 21 && !is_note_valid(test_note) {
-                                                  if let Some(prev) = test_note.checked_sub(12) {
-                                                      test_note = prev;
-                                                  } else { break; }
+                                              while test_note <= 108 && !is_note_valid(test_note) {
+                                                   if let Some(next) = test_note.checked_add(12) {
+                                                       test_note = next;
+                                                   } else { break; }
                                               }
                                               if is_note_valid(test_note) {
                                                   final_note = test_note;
                                                   valid = true;
+                                              } else {
+                                                   // Try moving down
+                                                   let mut test_note = final_note;
+                                                   while test_note >= 21 && !is_note_valid(test_note) {
+                                                       if let Some(prev) = test_note.checked_sub(12) {
+                                                           test_note = prev;
+                                                       } else { break; }
+                                                   }
+                                                   if is_note_valid(test_note) {
+                                                       final_note = test_note;
+                                                       valid = true;
+                                                   }
                                               }
-                                         }
-                                     }
-
-                                     if !valid {
-                                         return;
+                                          }
+    
+                                          if !valid {
+                                              return;
+                                          }
                                      }
                                      
+                                     // Common: Quantization Check
+                                     if status == 0x90 && velocity > 0 {
+                                          if shared_state.quantize_enabled.load(Ordering::Relaxed) {
+                                               let grid = shared_state.quantize_ms.load(Ordering::Relaxed);
+                                               if grid > 0 {
+                                                   if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                                                        let now_ms = duration.as_millis() as u64;
+                                                        let rem = now_ms % grid;
+                                                        if rem > 0 {
+                                                            let wait_ms = grid - rem;
+                                                            thread::sleep(time::Duration::from_millis(wait_ms));
+                                                        }
+                                                   }
+                                               }
+                                           }
+                                     }
+                                     
+                                     if use_solver {
+                                         let mut state = shared_state.device_state.lock().unwrap();
+                                         
+                                         // Solver Logic
+                                         if status == 0x90 && velocity > 0 {
+                                             // Note On
+                                             let mode = if shared_state.solver_mode_efficiency.load(Ordering::Relaxed) {
+                                                 SolverMode::Efficiency 
+                                             } else { SolverMode::Accuracy };
+                                             
+                                             let max_jump = shared_state.solver_max_jump.load(Ordering::Relaxed) as i32;
+                                             let range = shared_state.transpose_range.load(Ordering::Relaxed) as i32;
+                                             
+                                             if let Some((delta, mapping)) = state.solver.solve(note_original, mode, max_jump, range) {
+                                                 // Execute Solution
+                                                 
+                                                 // 1. Adjust Transpose
+                                                 let target_offset = delta;
+                                                 let current = state.solver.current_transpose; // Use solver's internal tracker
+                                                 
+                                                 if target_offset != current {
+                                                     let diff = target_offset - current;
+                                                     if diff > 0 {
+                                                         for _ in 0..diff {
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
+                                                             thread::sleep(time::Duration::from_millis(5)); // small delay for stability
+                                                         }
+                                                     } else {
+                                                         for _ in 0..diff.abs() {
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
+                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
+                                                             thread::sleep(time::Duration::from_millis(5));
+                                                         }
+                                                     }
+                                                     // Sync main state
+                                                     state.current_transpose_offset = target_offset;
+                                                 }
+                                                 
+                                                 // 2. Press Key
+                                                 // Handle Modifiers!
+                                                 // We need to sync physical modifiers with mapping.
+                                                 // If map.shift is true, we need Shift pressed.
+                                                 if mapping.shift && !state.solver.shift_active {
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 1)]);
+                                                 } else if !mapping.shift && state.solver.shift_active {
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
+                                                 }
+                                                 
+                                                 if mapping.ctrl && !state.solver.ctrl_active {
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
+                                                 } else if !mapping.ctrl && state.solver.ctrl_active {
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                                 }
+                                                 
+                                                 // Press the note key
+                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping.key_code.code(), 1)]);
+                                                 
+                                                 // Update Solver State
+                                                 state.solver.register_note_on(mapping.key_code, note_original, target_offset, mapping.shift, mapping.ctrl);
+                                             }
+                                         } else if status == 0x80 || (status == 0x90 && velocity == 0) {
+                                             // Note Off
+                                             if let Some(key_to_release) = state.solver.register_note_off(note_original) {
+                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, key_to_release.code(), 0)]);
+                                                 
+                                                 // Check if we emptied keys and need to release modifiers?
+                                                 // Solver updates internal state, but we need to update physical device
+                                                 // Solver state: shift_active, ctrl_active are updated in register_note_off if all keys gone
+                                                 
+                                                 if !state.solver.shift_active {
+                                                     // If physical shift is still held (we don't track physical separately, assume synced with solver state)
+                                                     // But wait, if we are 'lazy', we might leave it?
+                                                     // No, for Shift/Ctrl we should probably release if not needed to avoid interference with typing or other things?
+                                                     // Or just rely on next press? 
+                                                     // User said: "play multiple notes that would otherwise conflict".
+                                                     // If I release key A, but hold key B (which needs Shift), and key A needed Shift, then Shift stays on.
+                                                     // If I release key B (last key), Shift turns off in Solver. So we should send Shift Up.
+                                                     
+                                                     // We can just forcibly set Modifiers to match Solver State?
+                                                     // But we don't know "previous" state easily unless we track it or blindly emit.
+                                                     // Blindly emitting 0 is safe if it's already 0.
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
+                                                 }
+                                                 if !state.solver.ctrl_active {
+                                                     let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                                 }
+                                             }
+                                         }
+                                         
+                                         return;
+                                     }
+
                                      let use_experimental_transpose = shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
                                      let use_hold_ctrl = shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
 
-                                     let mappings = get_mappings();
+                                     let mappings = solver::get_available_mappings();
                                      if let Some(mapping) = mappings.iter().find(|m| m.midi_note == final_note) {
                                          let mut state = shared_state.device_state.lock().unwrap();
                                          let mapping_code = mapping.key_code;
@@ -398,21 +481,7 @@ impl eframe::App for MidiApp {
                                          
                                          // Note On (and velocity > 0)
                                          if status == 0x90 && velocity > 0 {
-                                             if shared_state.quantize_enabled.load(Ordering::Relaxed) {
-                                                  let grid = shared_state.quantize_ms.load(Ordering::Relaxed);
-                                                  if grid > 0 {
-                                                      if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                                                           let now_ms = duration.as_millis() as u64;
-                                                           let rem = now_ms % grid;
-                                                           if rem > 0 {
-                                                               let wait_ms = grid - rem;
-                                                               drop(state);
-                                                               thread::sleep(time::Duration::from_millis(wait_ms));
-                                                               state = shared_state.device_state.lock().unwrap();
-                                                           }
-                                                      }
-                                                  }
-                                              }
+                                             // ALREADY HANDLED QUANTIZATION ABOVE
                                              
                                              
                                              // --- Exact State Tracking / Lazy Transposition OR Naive ---
@@ -555,12 +624,40 @@ impl eframe::App for MidiApp {
 
             
             ui.add_space(10.0);
+            
+            ui.separator();
+            ui.heading("Window Settings");
+            
+            if ui.checkbox(&mut self.always_on_top, "Always On Top").changed() {
+                let level = if self.always_on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            }
+            
+            ui.horizontal(|ui| {
+                ui.label("Opacity:");
+                if ui.add(egui::Slider::new(&mut self.window_opacity, 0.1..=1.0)).changed() {
+                    let mut visuals = egui::Visuals::dark();
+                    let alpha = (self.window_opacity * 255.0) as u8;
+                    visuals.window_fill = egui::Color32::from_black_alpha(alpha);
+                    visuals.panel_fill = egui::Color32::from_black_alpha(alpha);
+                    ctx.set_visuals(visuals);
+                }
+            });
+
+            ui.add_space(10.0);
             ui.label(format!("Log: {}", self.status_message));
         });
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Force X11 backend to ensure Always On Top works
+    unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+
     println!("Initializing virtual keyboard (requires permissions to write to /dev/uinput)...");
     
     // keys is a set of KeyCodes
@@ -572,7 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     keys.insert(KeyCode::KEY_DOWN);
     
     // Register all mapped keys
-    for mapping in get_mappings() {
+    for mapping in solver::get_available_mappings() {
         keys.insert(mapping.key_code);
     }
 
@@ -582,7 +679,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_keys(&keys)?
         .build()?;
 
-    let options = eframe::NativeOptions::default();
+    let mut options = eframe::NativeOptions::default();
+    options.viewport = egui::ViewportBuilder::default().with_transparent(true);
     eframe::run_native(
         "Miditoroblox",
         options,
