@@ -36,6 +36,8 @@ struct SharedState {
     solver_mode_efficiency: AtomicBool, // true = Efficiency, false = Accuracy
     solver_max_jump: AtomicU64,
     transpose_range: AtomicU64, // e.g. 24
+    active_notes: Mutex<std::collections::HashSet<u8>>,
+    ui_context: Mutex<Option<egui::Context>>,
 }
 struct MidiApp {
     midi_input: Option<MidiInput>,
@@ -77,6 +79,8 @@ impl MidiApp {
                 solver_mode_efficiency: AtomicBool::new(true),
                 solver_max_jump: AtomicU64::new(10), // Default 10 semitones jump limit
                 transpose_range: AtomicU64::new(24),
+                active_notes: Mutex::new(std::collections::HashSet::new()),
+                ui_context: Mutex::new(None),
             }),
             status_message: "Ready".to_string(),
             window_opacity: 1.0,
@@ -137,6 +141,11 @@ impl MidiApp {
 
 impl eframe::App for MidiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Store context for background threads to request repaint
+        if let Ok(mut c) = self.shared_state.ui_context.lock() {
+            *c = Some(ctx.clone());
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Miditoroblox");
 
@@ -304,6 +313,29 @@ impl eframe::App for MidiApp {
                                      let channel = message[0] & 0x0F;
                                      let note_original = message[1];
                                      let velocity = message[2];
+
+                                     // Update Visualizer State
+                                     if status == 0x90 && velocity > 0 {
+                                         if let Ok(mut notes) = shared_state.active_notes.lock() {
+                                             notes.insert(note_original);
+                                         }
+                                         // Request UI Repaint
+                                         if let Ok(ctx_opt) = shared_state.ui_context.lock() {
+                                             if let Some(ctx) = ctx_opt.as_ref() {
+                                                 ctx.request_repaint();
+                                             }
+                                         }
+                                     } else if status == 0x80 || (status == 0x90 && velocity == 0) {
+                                         if let Ok(mut notes) = shared_state.active_notes.lock() {
+                                             notes.remove(&note_original);
+                                         }
+                                         // Request UI Repaint
+                                         if let Ok(ctx_opt) = shared_state.ui_context.lock() {
+                                              if let Some(ctx) = ctx_opt.as_ref() {
+                                                  ctx.request_repaint();
+                                              }
+                                         }
+                                     }
 
                                      // Ignore Channel 10 (Drums)
                                      if channel == 9 {
@@ -650,6 +682,82 @@ impl eframe::App for MidiApp {
 
             ui.add_space(10.0);
             ui.label(format!("Log: {}", self.status_message));
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.heading("Visualizer");
+            
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                let (response, painter) = ui.allocate_painter(egui::vec2(800.0, 100.0), egui::Sense::hover());
+                let rect = response.rect;
+                
+                let white_key_width = rect.width() / 52.0; // 52 white keys from A0 to C8
+                let black_key_width = white_key_width * 0.6;
+                let white_key_height = rect.height();
+                let black_key_height = rect.height() * 0.6;
+                
+                let active_set = if let Ok(n) = self.shared_state.active_notes.lock() {
+                    n.clone()
+                } else {
+                    std::collections::HashSet::new()
+                };
+
+                // Draw White Keys first
+                let mut x_pos = rect.min.x;
+                for note in 21..=108u8 {
+                    let is_black = match note % 12 {
+                        1 | 3 | 6 | 8 | 10 => true,
+                        _ => false,
+                    };
+                    
+                    if !is_black {
+                        let active = active_set.contains(&note);
+                        let color = if active { egui::Color32::GREEN } else { egui::Color32::WHITE };
+                        
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(egui::pos2(x_pos, rect.min.y), egui::vec2(white_key_width - 1.0, white_key_height)),
+                            2.0,
+                            color,
+                        );
+                        x_pos += white_key_width;
+                    }
+                }
+                
+                // Draw Black Keys on top
+                // We need to re-iterate or track position properly. 
+                // Easier to map note to x-offset.
+                // A0 (21) is first white key.
+                // White key index mapping:
+                let mut white_key_idx = 0;
+                for note in 21..=108u8 {
+                    let is_black = match note % 12 {
+                        1 | 3 | 6 | 8 | 10 => true,
+                        _ => false,
+                    };
+                    
+                    if is_black {
+                         // Centered on the line between current white key index (which is actually previous white key) 
+                         // and next.
+                         // Current white_key_idx represents the number of white keys passed.
+                         // The black key sits after the (white_key_idx - 1)-th key.
+                         let center_x = rect.min.x + (white_key_idx as f32 * white_key_width);
+                         
+                         let active = active_set.contains(&note);
+                         let color = if active { egui::Color32::GREEN } else { egui::Color32::BLACK };
+                         
+                         painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(center_x - (black_key_width / 2.0), rect.min.y), 
+                                egui::vec2(black_key_width, black_key_height)
+                            ),
+                            2.0,
+                            color,
+                        );
+                    } else {
+                        white_key_idx += 1;
+                    }
+                }
+            });
         });
     }
 }
