@@ -9,12 +9,10 @@ use std::thread;
 mod solver;
 use solver::{Solver, SolverMode};
 
-// Mappings moved to solver.rs
-
+// Mappings in solver.rs because yes
 
 struct DeviceState {
     device: VirtualDevice,
-    ctrl_count: usize,
     current_transpose_offset: i32,
     solver: Solver,
 }
@@ -35,8 +33,16 @@ struct SharedState {
     solver_enabled: AtomicBool,
     solver_mode_efficiency: AtomicBool, // true = Efficiency, false = Accuracy
     solver_max_jump: AtomicU64,
-    transpose_range: AtomicU64, // e.g. 24
+    transpose_range: AtomicU64,
     active_notes: Mutex<std::collections::HashSet<u8>>,
+    // Keys actually held down (Visualizer output) - tracking specific keys / notes
+
+    active_output_notes: Mutex<std::collections::HashSet<u8>>,
+    
+    visualizer_enabled: AtomicBool,
+    visualizer_show_midi: AtomicBool,
+    visualizer_show_roblox: AtomicBool,
+    
     ui_context: Mutex<Option<egui::Context>>,
 }
 struct MidiApp {
@@ -46,7 +52,6 @@ struct MidiApp {
     connection: Option<MidiInputConnection<Arc<SharedState>>>,
     shared_state: Arc<SharedState>,
     status_message: String,
-    // Window Settings
     window_opacity: f32,
     always_on_top: bool,
 }
@@ -61,7 +66,6 @@ impl MidiApp {
             shared_state: Arc::new(SharedState {
                 device_state: Mutex::new(DeviceState {
                     device: virtual_device,
-                    ctrl_count: 0,
                     current_transpose_offset: 0,
                     solver: Solver::new(),
                 }),
@@ -77,9 +81,13 @@ impl MidiApp {
                 quantize_ms: AtomicU64::new(100),
                 solver_enabled: AtomicBool::new(false),
                 solver_mode_efficiency: AtomicBool::new(true),
-                solver_max_jump: AtomicU64::new(10), // Default 10 semitones jump limit
+                solver_max_jump: AtomicU64::new(12),
                 transpose_range: AtomicU64::new(24),
                 active_notes: Mutex::new(std::collections::HashSet::new()),
+                active_output_notes: Mutex::new(std::collections::HashSet::new()),
+                visualizer_enabled: AtomicBool::new(true),
+                visualizer_show_midi: AtomicBool::new(true),
+                visualizer_show_roblox: AtomicBool::new(true),
                 ui_context: Mutex::new(None),
             }),
             status_message: "Ready".to_string(),
@@ -146,155 +154,181 @@ impl eframe::App for MidiApp {
             *c = Some(ctx.clone());
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Miditoroblox");
-
-            ui.add_space(10.0);
-
-            // MIDI Selection Area
+        // Header Section (MIDI Selector & Window Settings)
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Midi Device:");
-                
-                let ports_available = !self.available_ports.is_empty();
-                
-                egui::ComboBox::from_id_salt("midi_selector")
-                    .selected_text(self.selected_port_name.as_deref().unwrap_or(if ports_available { "Select Port" } else { "No Ports Found" }))
-                    .show_ui(ui, |ui| {
-                        for (name, _) in &self.available_ports {
-                            ui.selectable_value(&mut self.selected_port_name, Some(name.clone()), name);
-                        }
-                    });
+                // MIDI Selector
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let ports_len = self.available_ports.len();
+                    ui.label("Midi Device:");
+                    let response = egui::ComboBox::from_id_source("midi_selector_header")
+                        .selected_text(self.selected_port_name.as_deref().unwrap_or("Select MIDI Device"))
+                        .show_ui(ui, |ui| {
+                            for (i, (port_name, _)) in self.available_ports.iter().enumerate() {
+                                if ui.selectable_value(&mut self.selected_port_name, Some(port_name.clone()), port_name).clicked() {
+                                    // Handle selection if needed
+                                }
+                            }
+                        });
+                    
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_ports();
+                    }
+                });
 
-                if ui.button("Refresh").clicked() {
-                    self.refresh_ports();
-                }
+                // Window Settings (Opacity & Always On Top)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                     // Always On Top
+                    if ui.checkbox(&mut self.always_on_top, "Always On Top").changed() {
+                        let level = if self.always_on_top {
+                            egui::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::WindowLevel::Normal
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                    }
+                    
+                    ui.add_space(10.0);
+
+                    ui.label("Opacity:");
+                    if ui.add(egui::Slider::new(&mut self.window_opacity, 0.1..=1.0).show_value(false)).changed() {
+                        let mut visuals = egui::Visuals::dark();
+                        let alpha = (self.window_opacity * 255.0) as u8;
+                        visuals.window_fill = egui::Color32::from_black_alpha(alpha);
+                        visuals.panel_fill = egui::Color32::from_black_alpha(alpha);
+                        ctx.set_visuals(visuals);
+                    }
+                });
             });
+        });
 
-            ui.add_space(10.0);
+        egui::CentralPanel::default().show(ctx, |ui| {
 
             // Connection controls
-            if self.connection.is_some() {
-                ui.label(format!("Status: Connected to {}", self.selected_port_name.as_deref().unwrap_or("Unknown")));
-                
-                // Toggle for MIDI Mappings
-                let mut base_enabled = self.shared_state.base_mapping_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut base_enabled, "Enable Base (C2-C7)").changed() {
-                    self.shared_state.base_mapping_enabled.store(base_enabled, Ordering::Relaxed);
-                }
-                
-                let mut low_enabled = self.shared_state.low_mapping_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut low_enabled, "Enable Low Range (A0-B1)").changed() {
-                    self.shared_state.low_mapping_enabled.store(low_enabled, Ordering::Relaxed);
-                }
-                
-                let mut high_enabled = self.shared_state.high_mapping_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut high_enabled, "Enable High Range (C#7-C8)").changed() {
-                    self.shared_state.high_mapping_enabled.store(high_enabled, Ordering::Relaxed);
-                }
-
-                let mut auto_transpose = self.shared_state.auto_transpose_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut auto_transpose, "Enable Auto-Octave Transposition").changed() {
-                    self.shared_state.auto_transpose_enabled.store(auto_transpose, Ordering::Relaxed);
-                }
-                
-                let mut experimental_transpose = self.shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut experimental_transpose, "Experimental: Transpose Method for Black Keys").changed() {
-                    self.shared_state.experimental_transpose_enabled.store(experimental_transpose, Ordering::Relaxed);
-                }
-
-
-
-                if experimental_transpose {
-                     let mut delay = self.shared_state.transpose_delay_ms.load(Ordering::Relaxed);
-                     if ui.add(egui::Slider::new(&mut delay, 0..=200).text("Transpose Delay (ms)")).changed() {
-                         self.shared_state.transpose_delay_ms.store(delay, Ordering::Relaxed);
-                     }
-                     
-                     let mut lazy = self.shared_state.lazy_transpose_enabled.load(Ordering::Relaxed);
-                     if ui.checkbox(&mut lazy, "Enable Lazy Optimization (Reduce Key Presses)").changed() {
-                         self.shared_state.lazy_transpose_enabled.store(lazy, Ordering::Relaxed);
-                     }
-                     
-                     if lazy {
-                         ui.label(egui::RichText::new("⚠️ Ensure in-game transposition is 0 before starting!").color(egui::Color32::YELLOW));
-                     }
-                }
-
-                let mut hold_ctrl = self.shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut hold_ctrl, "Experimental: Hold Notes for Low/High Range (Ctrl)").changed() {
-                    self.shared_state.experimental_hold_ctrl_enabled.store(hold_ctrl, Ordering::Relaxed);
-                }
-                
-                ui.separator();
-                let mut quantize = self.shared_state.quantize_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut quantize, "Enable Note Quantization (Grid Snap)").changed() {
-                    self.shared_state.quantize_enabled.store(quantize, Ordering::Relaxed);
-                }
-                if quantize {
-                     let mut q_ms = self.shared_state.quantize_ms.load(Ordering::Relaxed);
-                     if ui.add(egui::Slider::new(&mut q_ms, 10..=1000).text("Grid Size (ms)")).changed() {
-                         self.shared_state.quantize_ms.store(q_ms, Ordering::Relaxed);
-                     }
-                }
-                
-                ui.separator();
-                ui.heading("Smart Solver");
-                let mut solver_on = self.shared_state.solver_enabled.load(Ordering::Relaxed);
-                if ui.checkbox(&mut solver_on, "Enable Smart Solver (Experimental)").changed() {
-                    self.shared_state.solver_enabled.store(solver_on, Ordering::Relaxed);
-                }
-                
-                if solver_on {
-                    ui.label(egui::RichText::new("⚠️ IMPORTANT: Ensure in-game transposition is 0 before starting!").color(egui::Color32::RED));
-                    
-                    let mut is_efficiency = self.shared_state.solver_mode_efficiency.load(Ordering::Relaxed);
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut is_efficiency, true, "Efficiency (Least Clicks)");
-                        ui.radio_value(&mut is_efficiency, false, "Accuracy (Best Match)");
-                    });
-                     if is_efficiency != self.shared_state.solver_mode_efficiency.load(Ordering::Relaxed) {
-                        self.shared_state.solver_mode_efficiency.store(is_efficiency, Ordering::Relaxed);
-                    }
-                    
-                    if is_efficiency {
-                         let mut max_jump = self.shared_state.solver_max_jump.load(Ordering::Relaxed);
-                         if ui.add(egui::Slider::new(&mut max_jump, 1..=24).text("Max Jump Distance")).changed() {
-                             self.shared_state.solver_max_jump.store(max_jump, Ordering::Relaxed);
+            if let Some(_) = &self.connection {
+                ui.horizontal(|ui| {
+                     ui.label(egui::RichText::new("Status: Connected").color(egui::Color32::GREEN));
+                     if ui.button("Disconnect").clicked() {
+                         self.connection = None;
+                         self.status_message = "Disconnected".to_string();
+                         if self.midi_input.is_none() {
+                             self.midi_input = Some(MidiInput::new("Miditoroblox Input").unwrap());
                          }
-                    }
-                    
-                    let mut range = self.shared_state.transpose_range.load(Ordering::Relaxed);
-                    if ui.add(egui::Slider::new(&mut range, 12..=36).text("Transposition Range (+/-)")).changed() {
-                        self.shared_state.transpose_range.store(range, Ordering::Relaxed);
-                    }
-                    
-                    ui.add_space(5.0);
+                         self.refresh_ports();
+                     }
+                });
+                
+                ui.separator();
+
+                // Settings Group
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    let mut base_enabled = self.shared_state.base_mapping_enabled.load(Ordering::Relaxed);
+                    let mut low_enabled = self.shared_state.low_mapping_enabled.load(Ordering::Relaxed);
+                    let mut high_enabled = self.shared_state.high_mapping_enabled.load(Ordering::Relaxed);
+
                     ui.horizontal(|ui| {
-                        if ui.button("Reset Solver Transpose (0)").clicked() {
-                            let mut state = self.shared_state.device_state.lock().unwrap();
-                            state.solver.reset_transpose();
-                            state.current_transpose_offset = 0; // Sync
+                        if ui.checkbox(&mut base_enabled, "Start (Middle Octaves)").changed() {
+                            self.shared_state.base_mapping_enabled.store(base_enabled, Ordering::Relaxed);
                         }
-                        if ui.button("Panic: Release All Keys").clicked() {
-                            let mut state = self.shared_state.device_state.lock().unwrap();
-                            let keys = state.solver.reset_keys();
-                            for k in keys {
-                                let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, k.code(), 0)]);
-                            }
-                            // Also ensure modifiers are down
-                            let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
-                            let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                        if ui.checkbox(&mut low_enabled, "Low Range").changed() {
+                            self.shared_state.low_mapping_enabled.store(low_enabled, Ordering::Relaxed);
+                        }
+                        if ui.checkbox(&mut high_enabled, "High Range").changed() {
+                            self.shared_state.high_mapping_enabled.store(high_enabled, Ordering::Relaxed);
                         }
                     });
-                }
 
-                if ui.button("Disconnect").clicked() {
-                    self.connection = None;
-                    // Re-create input for future scanning
-                    self.midi_input = Some(MidiInput::new("Miditoroblox Input").unwrap()); 
-                    self.refresh_ports();
-                    self.status_message = "Disconnected".to_string();
-                }
+                    let mut auto_transpose = self.shared_state.auto_transpose_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut auto_transpose, "Enable Auto-Octave Transposition").changed() {
+                        self.shared_state.auto_transpose_enabled.store(auto_transpose, Ordering::Relaxed);
+                    }
+
+                    ui.separator();
+                    
+                    // Experimental Section
+                    ui.label(egui::RichText::new("Experimental").strong());
+                    
+                    let mut exp_transpose = self.shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut exp_transpose, "Black Keys using Transpose").changed() {
+                        self.shared_state.experimental_transpose_enabled.store(exp_transpose, Ordering::Relaxed);
+                    }
+                    
+                    if exp_transpose {
+                        let mut delay = self.shared_state.transpose_delay_ms.load(Ordering::Relaxed);
+                        if ui.add(egui::Slider::new(&mut delay, 0..=1000).text("Transpose Delay (ms)")).changed() {
+                            self.shared_state.transpose_delay_ms.store(delay, Ordering::Relaxed);
+                        }
+                        let mut lazy = self.shared_state.lazy_transpose_enabled.load(Ordering::Relaxed);
+                        if ui.checkbox(&mut lazy, "Optimized Transpose").changed() {
+                            self.shared_state.lazy_transpose_enabled.store(lazy, Ordering::Relaxed);
+                        }
+                    }
+
+                    let mut exp_hold = self.shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut exp_hold, "Hold CTRL for Upper/Lower ranges").changed() {
+                        self.shared_state.experimental_hold_ctrl_enabled.store(exp_hold, Ordering::Relaxed);
+                    }
+
+                    let mut solver_en = self.shared_state.solver_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut solver_en, "Smart Solver").changed() {
+                        self.shared_state.solver_enabled.store(solver_en, Ordering::Relaxed);
+                    }
+                     
+                    if solver_en {
+                        ui.indent("solver_settings", |ui| {
+                            let mut is_efficiency = self.shared_state.solver_mode_efficiency.load(Ordering::Relaxed);
+                            ui.horizontal(|ui| {
+                                if ui.radio_value(&mut is_efficiency, true, "Efficiency (Least Clicks)").clicked() {
+                                    self.shared_state.solver_mode_efficiency.store(true, Ordering::Relaxed);
+                                }
+                                if ui.radio_value(&mut is_efficiency, false, "Accuracy (Best Match)").clicked() {
+                                    self.shared_state.solver_mode_efficiency.store(false, Ordering::Relaxed);
+                                }
+                            });
+                            
+                            let mut max_jump = self.shared_state.solver_max_jump.load(Ordering::Relaxed);
+                            if ui.add(egui::Slider::new(&mut max_jump, 1..=24).text("Max Jump Distance")).changed() {
+                                self.shared_state.solver_max_jump.store(max_jump, Ordering::Relaxed);
+                            }
+                            
+                            let mut range = self.shared_state.transpose_range.load(Ordering::Relaxed);
+                            if ui.add(egui::Slider::new(&mut range, 12..=36).text("Transposition Range (+/-)")).changed() {
+                                self.shared_state.transpose_range.store(range, Ordering::Relaxed);
+                            }
+                            
+                            ui.horizontal(|ui| {
+                                if ui.button("Reset Solver").clicked() {
+                                     let mut state = self.shared_state.device_state.lock().unwrap();
+                                     state.solver.reset_transpose();
+                                     state.current_transpose_offset = 0;
+                                }
+                                if ui.button("Release Keys").clicked() {
+                                    let mut state = self.shared_state.device_state.lock().unwrap();
+                                    let keys = state.solver.reset_keys();
+                                    for k in keys {
+                                        let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, k.code(), 0)]);
+                                    }
+                                    let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
+                                    let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
+                                }
+                            });
+                        });
+                    }
+
+                    ui.separator();
+                    
+                    // Quantization
+                    let mut quant_enabled = self.shared_state.quantize_enabled.load(Ordering::Relaxed);
+                    if ui.checkbox(&mut quant_enabled, "Enable Note Quantization").changed() {
+                        self.shared_state.quantize_enabled.store(quant_enabled, Ordering::Relaxed);
+                    }
+                    if quant_enabled {
+                        let mut ms = self.shared_state.quantize_ms.load(Ordering::Relaxed);
+                        if ui.add(egui::Slider::new(&mut ms, 10..=500).text("Quantize (ms)")).changed() {
+                            self.shared_state.quantize_ms.store(ms, Ordering::Relaxed);
+                        }
+                    }
+                });
             } else {
                  ui.label("Status: Not Connected");
                  let connect_enabled = self.selected_port_name.is_some();
@@ -305,20 +339,19 @@ impl eframe::App for MidiApp {
                                  let shared_clone = self.shared_state.clone();
                                  // connect
                                  match midi_in.connect(port, "miditoroblox-in", move |_stamp, message, shared_state| {
-                                     // MIDI Callback
-                                     // 0x90 is Note On channel 0. 0x80 is Note Off channel 0.
-                                     
                                      if message.len() < 3 { return; }
                                      let status = message[0] & 0xF0;
                                      let channel = message[0] & 0x0F;
                                      let note_original = message[1];
                                      let velocity = message[2];
 
-                                     // Update Visualizer State
+                                     // Update Visualizer State (Input)
                                      if status == 0x90 && velocity > 0 {
                                          if let Ok(mut notes) = shared_state.active_notes.lock() {
                                              notes.insert(note_original);
                                          }
+                                         // Real output tracking happens below when we emit keys.
+                                         
                                          // Request UI Repaint
                                          if let Ok(ctx_opt) = shared_state.ui_context.lock() {
                                              if let Some(ctx) = ctx_opt.as_ref() {
@@ -329,7 +362,7 @@ impl eframe::App for MidiApp {
                                          if let Ok(mut notes) = shared_state.active_notes.lock() {
                                              notes.remove(&note_original);
                                          }
-                                         // Request UI Repaint
+                                         // Note Off Repaint
                                          if let Ok(ctx_opt) = shared_state.ui_context.lock() {
                                               if let Some(ctx) = ctx_opt.as_ref() {
                                                   ctx.request_repaint();
@@ -342,7 +375,9 @@ impl eframe::App for MidiApp {
                                          return;
                                      }
                                      
-                                     // Helper to check if a note is enabled
+                                     // Validate Note
+
+                                     
                                      let is_note_valid = |n: u8| -> bool {
                                           if n < 36 {
                                               shared_state.low_mapping_enabled.load(Ordering::Relaxed)
@@ -356,101 +391,79 @@ impl eframe::App for MidiApp {
                                      let mut final_note = note_original;
                                      let mut valid = is_note_valid(final_note);
                                      
-                                     // Auto-transpose logic if solver is NOT enabled (legacy behavior)
                                      let use_solver = shared_state.solver_enabled.load(Ordering::Relaxed);
 
                                      if !use_solver {
                                           if !valid && shared_state.auto_transpose_enabled.load(Ordering::Relaxed) {
-                                              // If note is too low, move up
+                                              // Auto-transpose up
                                               let mut test_note = final_note;
                                               while test_note <= 108 && !is_note_valid(test_note) {
-                                                   if let Some(next) = test_note.checked_add(12) {
-                                                       test_note = next;
-                                                   } else { break; }
+                                                   if let Some(next) = test_note.checked_add(12) { test_note = next; } else { break; }
                                               }
-                                              if is_note_valid(test_note) {
-                                                  final_note = test_note;
-                                                  valid = true;
-                                              } else {
-                                                   // Try moving down
+                                              if is_note_valid(test_note) { final_note = test_note; valid = true; } 
+                                              else {
+                                                   // Auto-transpose down
                                                    let mut test_note = final_note;
                                                    while test_note >= 21 && !is_note_valid(test_note) {
-                                                       if let Some(prev) = test_note.checked_sub(12) {
-                                                           test_note = prev;
-                                                       } else { break; }
+                                                       if let Some(prev) = test_note.checked_sub(12) { test_note = prev; } else { break; }
                                                    }
-                                                   if is_note_valid(test_note) {
-                                                       final_note = test_note;
-                                                       valid = true;
-                                                   }
+                                                   if is_note_valid(test_note) { final_note = test_note; valid = true; }
                                               }
                                           }
     
-                                          if !valid {
-                                              return;
-                                          }
+                                          if !valid { return; }
                                      }
                                      
-                                     // Common: Quantization Check
-                                     if status == 0x90 && velocity > 0 {
-                                          if shared_state.quantize_enabled.load(Ordering::Relaxed) {
-                                               let grid = shared_state.quantize_ms.load(Ordering::Relaxed);
-                                               if grid > 0 {
-                                                   if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                                                        let now_ms = duration.as_millis() as u64;
-                                                        let rem = now_ms % grid;
-                                                        if rem > 0 {
-                                                            let wait_ms = grid - rem;
-                                                            thread::sleep(time::Duration::from_millis(wait_ms));
-                                                        }
+                                     // Quantization
+                                     if status == 0x90 && velocity > 0 && shared_state.quantize_enabled.load(Ordering::Relaxed) {
+                                          let grid = shared_state.quantize_ms.load(Ordering::Relaxed);
+                                          if grid > 0 {
+                                              if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                                                   let rem = (duration.as_millis() as u64) % grid;
+                                                   if rem > 0 {
+                                                       thread::sleep(time::Duration::from_millis(grid - rem));
                                                    }
-                                               }
-                                           }
+                                              }
+                                          }
                                      }
                                      
                                      if use_solver {
                                          let mut state = shared_state.device_state.lock().unwrap();
-                                         
-                                         // Solver Logic
                                          if status == 0x90 && velocity > 0 {
-                                             // Note On
-                                             let mode = if shared_state.solver_mode_efficiency.load(Ordering::Relaxed) {
-                                                 SolverMode::Efficiency 
-                                             } else { SolverMode::Accuracy };
-                                             
+                                             let mode = if shared_state.solver_mode_efficiency.load(Ordering::Relaxed) { SolverMode::Efficiency } else { SolverMode::Accuracy };
                                              let max_jump = shared_state.solver_max_jump.load(Ordering::Relaxed) as i32;
                                              let range = shared_state.transpose_range.load(Ordering::Relaxed) as i32;
                                              
                                              if let Some((delta, mapping)) = state.solver.solve(note_original, mode, max_jump, range) {
-                                                 // Execute Solution
-                                                 
-                                                 // 1. Adjust Transpose
-                                                 let target_offset = delta;
-                                                 let current = state.solver.current_transpose; // Use solver's internal tracker
-                                                 
-                                                 if target_offset != current {
-                                                     let diff = target_offset - current;
-                                                     if diff > 0 {
-                                                         for _ in 0..diff {
-                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
-                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
-                                                             thread::sleep(time::Duration::from_millis(5)); // small delay for stability
-                                                         }
-                                                     } else {
-                                                         for _ in 0..diff.abs() {
-                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
-                                                             let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
-                                                             thread::sleep(time::Duration::from_millis(5));
-                                                         }
+                                                 // Track Output
+                                                 if let Ok(mut out_notes) = shared_state.active_output_notes.lock() {
+                                                     out_notes.insert(note_original);
+                                                 }
+
+                                                 // Adjust Transpose
+                                                 let current = state.solver.current_transpose;
+                                                 if delta != current {
+                                                     let diff = delta - current;
+                                                     let key = if diff > 0 { KeyCode::KEY_UP } else { KeyCode::KEY_DOWN };
+                                                     for _ in 0..diff.abs() {
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, key.code(), 1)]);
+                                                         let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, key.code(), 0)]);
+                                                         thread::sleep(time::Duration::from_millis(5));
                                                      }
-                                                     // Sync main state
-                                                     state.current_transpose_offset = target_offset;
+                                                     state.current_transpose_offset = delta;
                                                  }
                                                  
-                                                 // 2. Press Key
-                                                 // Handle Modifiers!
-                                                 // We need to sync physical modifiers with mapping.
-                                                 // If map.shift is true, we need Shift pressed.
+                                                 // Press Note
+                                                 // Handle Active Key "Stealing"
+                                                 // The solver now allows returning a busy key with a penalty.
+                                                 // Check if key is physically held?
+                                                 // state.solver.active_keys tracks keys with active notes.
+                                                 if state.solver.active_keys.contains_key(&mapping.key_code) && !state.solver.active_keys[&mapping.key_code].is_empty() {
+                                                      // Force Release first
+                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping.key_code.code(), 0)]);
+                                                      thread::sleep(time::Duration::from_millis(5)); // Brief pause
+                                                 }
+
                                                  if mapping.shift && !state.solver.shift_active {
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 1)]);
                                                  } else if !mapping.shift && state.solver.shift_active {
@@ -463,33 +476,20 @@ impl eframe::App for MidiApp {
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
                                                  }
                                                  
-                                                 // Press the note key
                                                  let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping.key_code.code(), 1)]);
-                                                 
-                                                 // Update Solver State
-                                                 state.solver.register_note_on(mapping.key_code, note_original, target_offset, mapping.shift, mapping.ctrl);
+                                                 state.solver.register_note_on(mapping.key_code, note_original, delta, mapping.shift, mapping.ctrl);
                                              }
                                          } else if status == 0x80 || (status == 0x90 && velocity == 0) {
-                                             // Note Off
-                                             if let Some(key_to_release) = state.solver.register_note_off(note_original) {
-                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, key_to_release.code(), 0)]);
+                                             if let Some(key) = state.solver.register_note_off(note_original) {
+                                                 // Track Output Removel
+                                                 if let Ok(mut out_notes) = shared_state.active_output_notes.lock() {
+                                                     out_notes.remove(&note_original);
+                                                 }
+
+                                                 let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, key.code(), 0)]);
                                                  
-                                                 // Check if we emptied keys and need to release modifiers?
-                                                 // Solver updates internal state, but we need to update physical device
-                                                 // Solver state: shift_active, ctrl_active are updated in register_note_off if all keys gone
-                                                 
+                                                 // Modifiers cleanup
                                                  if !state.solver.shift_active {
-                                                     // If physical shift is still held (we don't track physical separately, assume synced with solver state)
-                                                     // But wait, if we are 'lazy', we might leave it?
-                                                     // No, for Shift/Ctrl we should probably release if not needed to avoid interference with typing or other things?
-                                                     // Or just rely on next press? 
-                                                     // User said: "play multiple notes that would otherwise conflict".
-                                                     // If I release key A, but hold key B (which needs Shift), and key A needed Shift, then Shift stays on.
-                                                     // If I release key B (last key), Shift turns off in Solver. So we should send Shift Up.
-                                                     
-                                                     // We can just forcibly set Modifiers to match Solver State?
-                                                     // But we don't know "previous" state easily unless we track it or blindly emit.
-                                                     // Blindly emitting 0 is safe if it's already 0.
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
                                                  }
                                                  if !state.solver.ctrl_active {
@@ -497,10 +497,10 @@ impl eframe::App for MidiApp {
                                                  }
                                              }
                                          }
-                                         
                                          return;
                                      }
 
+                                     // Legacy Logic
                                      let use_experimental_transpose = shared_state.experimental_transpose_enabled.load(Ordering::Relaxed);
                                      let use_hold_ctrl = shared_state.experimental_hold_ctrl_enabled.load(Ordering::Relaxed);
 
@@ -511,68 +511,44 @@ impl eframe::App for MidiApp {
                                          let mapping_shift = mapping.shift;
                                          let mapping_ctrl = mapping.ctrl;
                                          
-                                         // Note On (and velocity > 0)
                                          if status == 0x90 && velocity > 0 {
-                                             // ALREADY HANDLED QUANTIZATION ABOVE
+                                             if let Ok(mut out_notes) = shared_state.active_output_notes.lock() { out_notes.insert(note_original); }
                                              
-                                             
-                                             // --- Exact State Tracking / Lazy Transposition OR Naive ---
                                              let mut handled_transpose = false;
                                              
                                              if use_experimental_transpose {
                                                  let use_lazy = shared_state.lazy_transpose_enabled.load(Ordering::Relaxed);
-                                                 
                                                  if use_lazy {
-                                                     // Lazy Mode
                                                      let target_offset = if mapping_shift && !mapping_ctrl { 1 } else { 0 };
                                                      let current_offset = state.current_transpose_offset;
-
                                                      if target_offset != current_offset {
                                                          let delay_ms = shared_state.transpose_delay_ms.load(Ordering::Relaxed);
-                                                         
-                                                         // We need to move
                                                          if target_offset > current_offset {
-                                                             // Need invalid +1 (Assuming we only go 0 <-> 1)
-                                                             // Tap UP
                                                              let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
                                                              let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
                                                          } else {
-                                                             // Need -1
-                                                             // Tap DOWN
                                                              let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
                                                              let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
                                                          }
-
                                                          if delay_ms > 0 {
                                                              drop(state);
                                                              thread::sleep(time::Duration::from_millis(delay_ms));
                                                              state = shared_state.device_state.lock().unwrap();
                                                          }
-                                                         
                                                          state.current_transpose_offset = target_offset;
                                                      }
                                                      handled_transpose = true;
-                                                     
                                                  } else {
-                                                     // Naive Mode (Up -> Note -> Down)
-                                                     // We handle this inside boolean logic below only for Shift notes
-                                                     // But we must reset state tracker just in case user switched modes mid-stream
                                                      state.current_transpose_offset = 0; 
                                                  }
                                              }
-
-
+ 
                                              if mapping_ctrl {
                                                  if use_hold_ctrl {
-                                                     // Experimental Hold Mode: Tap Ctrl, Hold Key
-                                                     // 1. Press Ctrl
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
-                                                     // 2. Press Note (Hold)
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
-                                                     // 3. Release Ctrl
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0)]);
                                                  } else {
-                                                     // Ctrl Key: Atomic Ctrl Tap (Original)
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1)]);
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
@@ -581,63 +557,39 @@ impl eframe::App for MidiApp {
                                              } else if mapping_shift {
                                                  if use_experimental_transpose {
                                                      if handled_transpose {
-                                                         // Lazy Mode: State is set, just press key
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
                                                      } else {
-                                                         // Naive Mode: Up -> Note -> Down
                                                          let delay_ms = shared_state.transpose_delay_ms.load(Ordering::Relaxed);
-                                                         
-                                                         // 1. Up
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 1)]);
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.code(), 0)]);
-                                                         
-                                                         if delay_ms > 0 {
-                                                             drop(state);
-                                                             thread::sleep(time::Duration::from_millis(delay_ms));
-                                                             state = shared_state.device_state.lock().unwrap();
-                                                         }
-                                                         
-                                                         // 2. Note
+                                                         if delay_ms > 0 { drop(state); thread::sleep(time::Duration::from_millis(delay_ms)); state = shared_state.device_state.lock().unwrap(); }
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
-
-                                                         if delay_ms > 0 {
-                                                             drop(state);
-                                                             thread::sleep(time::Duration::from_millis(delay_ms));
-                                                             state = shared_state.device_state.lock().unwrap();
-                                                         }
-                                                         
-                                                         // 3. Down
+                                                         if delay_ms > 0 { drop(state); thread::sleep(time::Duration::from_millis(delay_ms)); state = shared_state.device_state.lock().unwrap(); }
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 1)]);
                                                          let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.code(), 0)]);
                                                      }
                                                  } else {
-                                                     // Default: Atomic Shift Tap
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 1)]);
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                                      let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0)]);
                                                  }
                                              } else {
-                                                  // White Key: Normal Press
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 1)]);
                                              }
                                          }
-                                         // Note Off or Note On with velocity 0
                                          else if status == 0x80 || (status == 0x90 && velocity == 0) {
+                                              if let Ok(mut out_notes) = shared_state.active_output_notes.lock() { out_notes.remove(&note_original); }
+
                                               if mapping_ctrl && use_hold_ctrl {
-                                                  // Release Mode for Ctrl: Just release the key
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                               } else if mapping_shift && use_experimental_transpose {
-                                                  // Release logic for experimental mode: Stop Holding Key
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                               } else if !mapping_shift && !mapping_ctrl {
-                                                  // White Key: Normal Release
                                                   let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, mapping_code.code(), 0)]);
                                               }
-                                              // Standard Black/Ctrl keys (in non-hold mode) are auto-released on NoteOn, so ignore NoteOff
                                          }
                                      }
-
                                  }, shared_clone) {
                                      Ok(conn) => {
                                          self.connection = Some(conn);
@@ -656,108 +608,96 @@ impl eframe::App for MidiApp {
 
             
             ui.add_space(10.0);
-            
-            ui.separator();
-            ui.heading("Window Settings");
-            
-            if ui.checkbox(&mut self.always_on_top, "Always On Top").changed() {
-                let level = if self.always_on_top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                };
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-            }
-            
-            ui.horizontal(|ui| {
-                ui.label("Opacity:");
-                if ui.add(egui::Slider::new(&mut self.window_opacity, 0.1..=1.0)).changed() {
-                    let mut visuals = egui::Visuals::dark();
-                    let alpha = (self.window_opacity * 255.0) as u8;
-                    visuals.window_fill = egui::Color32::from_black_alpha(alpha);
-                    visuals.panel_fill = egui::Color32::from_black_alpha(alpha);
-                    ctx.set_visuals(visuals);
-                }
-            });
-
-            ui.add_space(10.0);
             ui.label(format!("Log: {}", self.status_message));
-
+            
             ui.add_space(10.0);
             ui.separator();
-            ui.heading("Visualizer");
             
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                let (response, painter) = ui.allocate_painter(egui::vec2(800.0, 100.0), egui::Sense::hover());
-                let rect = response.rect;
-                
-                let white_key_width = rect.width() / 52.0; // 52 white keys from A0 to C8
-                let black_key_width = white_key_width * 0.6;
-                let white_key_height = rect.height();
-                let black_key_height = rect.height() * 0.6;
-                
-                let active_set = if let Ok(n) = self.shared_state.active_notes.lock() {
-                    n.clone()
-                } else {
-                    std::collections::HashSet::new()
-                };
-
-                // Draw White Keys first
-                let mut x_pos = rect.min.x;
-                for note in 21..=108u8 {
-                    let is_black = match note % 12 {
-                        1 | 3 | 6 | 8 | 10 => true,
-                        _ => false,
-                    };
-                    
-                    if !is_black {
-                        let active = active_set.contains(&note);
-                        let color = if active { egui::Color32::GREEN } else { egui::Color32::WHITE };
-                        
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(egui::pos2(x_pos, rect.min.y), egui::vec2(white_key_width - 1.0, white_key_height)),
-                            2.0,
-                            color,
-                        );
-                        x_pos += white_key_width;
-                    }
+            let mut vis_enabled = self.shared_state.visualizer_enabled.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut vis_enabled, "Show Visualizer").changed() {
+                     self.shared_state.visualizer_enabled.store(vis_enabled, Ordering::Relaxed);
                 }
                 
-                // Draw Black Keys on top
-                // We need to re-iterate or track position properly. 
-                // Easier to map note to x-offset.
-                // A0 (21) is first white key.
-                // White key index mapping:
-                let mut white_key_idx = 0;
-                for note in 21..=108u8 {
-                    let is_black = match note % 12 {
-                        1 | 3 | 6 | 8 | 10 => true,
-                        _ => false,
-                    };
-                    
-                    if is_black {
-                         // Centered on the line between current white key index (which is actually previous white key) 
-                         // and next.
-                         // Current white_key_idx represents the number of white keys passed.
-                         // The black key sits after the (white_key_idx - 1)-th key.
-                         let center_x = rect.min.x + (white_key_idx as f32 * white_key_width);
-                         
-                         let active = active_set.contains(&note);
-                         let color = if active { egui::Color32::GREEN } else { egui::Color32::BLACK };
-                         
-                         painter.rect_filled(
-                            egui::Rect::from_min_size(
-                                egui::pos2(center_x - (black_key_width / 2.0), rect.min.y), 
-                                egui::vec2(black_key_width, black_key_height)
-                            ),
-                            2.0,
-                            color,
-                        );
-                    } else {
-                        white_key_idx += 1;
-                    }
+                if vis_enabled {
+                    ui.separator();
+                    ui.label("Show Mode:");
+                    egui::ComboBox::from_id_source("vis_mode")
+                        .selected_text("Select Modes...")
+                        .show_ui(ui, |ui| {
+                             let mut show_midi = self.shared_state.visualizer_show_midi.load(Ordering::Relaxed);
+                             if ui.checkbox(&mut show_midi, "Midi Inputs").changed() {
+                                 self.shared_state.visualizer_show_midi.store(show_midi, Ordering::Relaxed);
+                             }
+                             let mut show_roblox = self.shared_state.visualizer_show_roblox.load(Ordering::Relaxed);
+                             if ui.checkbox(&mut show_roblox, "Roblox Played").changed() {
+                                 self.shared_state.visualizer_show_roblox.store(show_roblox, Ordering::Relaxed);
+                             }
+                        });
                 }
             });
+            
+            if vis_enabled {
+                egui::ScrollArea::horizontal().enable_scrolling(false).show(ui, |ui| {
+                    let (response, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), 100.0), egui::Sense::hover());
+                    let rect = response.rect;
+                    
+                    let white_key_width = rect.width() / 52.0; 
+                    let black_key_width = white_key_width * 0.6;
+                    let white_key_height = rect.height();
+                    let black_key_height = rect.height() * 0.6;
+                    
+                    let input_set = if let Ok(n) = self.shared_state.active_notes.lock() { n.clone() } else { std::collections::HashSet::new() };
+                    let output_set = if let Ok(n) = self.shared_state.active_output_notes.lock() { n.clone() } else { std::collections::HashSet::new() };
+                    
+                    let show_input = self.shared_state.visualizer_show_midi.load(Ordering::Relaxed);
+                    let show_output = self.shared_state.visualizer_show_roblox.load(Ordering::Relaxed);
+
+                    let draw_key = |key_rect: egui::Rect, note: u8, is_black: bool| {
+                        let inp = show_input && input_set.contains(&note);
+                        let outp = show_output && output_set.contains(&note);
+                        
+                        let base_color = if is_black { egui::Color32::BLACK } else { egui::Color32::WHITE };
+                        let input_color = egui::Color32::GREEN;
+                        let output_color = egui::Color32::from_rgb(0, 100, 255); 
+
+                        if inp && outp && show_input && show_output {
+                            let half_h = key_rect.height() / 2.0;
+                            painter.rect_filled(egui::Rect::from_min_size(key_rect.min, egui::vec2(key_rect.width(), half_h)), if is_black {1.0} else {2.0}, input_color);
+                            painter.rect_filled(egui::Rect::from_min_size(egui::pos2(key_rect.min.x, key_rect.min.y + half_h), egui::vec2(key_rect.width(), half_h)), if is_black {1.0} else {2.0}, output_color);
+                        } else if inp {
+                             painter.rect_filled(key_rect, if is_black {1.0} else {2.0}, input_color);
+                        } else if outp {
+                             painter.rect_filled(key_rect, if is_black {1.0} else {2.0}, output_color);
+                        } else {
+                             painter.rect_filled(key_rect, if is_black {1.0} else {2.0}, base_color);
+                        }
+                        painter.rect(key_rect, 1.0, egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Inside);
+                    };
+
+                    let mut x_pos = rect.min.x;
+                    for note in 21..=108u8 {
+                         let is_black = match note % 12 { 1 | 3 | 6 | 8 | 10 => true, _ => false };
+                         if !is_black {
+                             let key_rect = egui::Rect::from_min_size(egui::pos2(x_pos, rect.min.y), egui::vec2(white_key_width, white_key_height));
+                             draw_key(key_rect, note, false);
+                             x_pos += white_key_width;
+                         }
+                    }
+                    
+                    let mut white_key_idx = 0;
+                    for note in 21..=108u8 {
+                        let is_black = match note % 12 { 1 | 3 | 6 | 8 | 10 => true, _ => false };
+                        if is_black {
+                             let center_x = rect.min.x + (white_key_idx as f32 * white_key_width);
+                             let key_rect = egui::Rect::from_min_size(egui::pos2(center_x - (black_key_width/2.0), rect.min.y), egui::vec2(black_key_width, black_key_height));
+                             draw_key(key_rect, note, true);
+                        } else {
+                            white_key_idx += 1;
+                        }
+                    }
+                });
+            }
         });
     }
 }
@@ -768,7 +708,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Initializing virtual keyboard (requires permissions to write to /dev/uinput)...");
     
-    // keys is a set of KeyCodes
     let mut keys = AttributeSet::<KeyCode>::new();
     keys.insert(KeyCode::KEY_E);
     keys.insert(KeyCode::KEY_LEFTSHIFT);
@@ -788,7 +727,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut options = eframe::NativeOptions::default();
-    options.viewport = egui::ViewportBuilder::default().with_transparent(true);
+    options.viewport = egui::ViewportBuilder::default()
+        .with_transparent(true)
+        .with_inner_size([1000.0, 600.0]);
     eframe::run_native(
         "Miditoroblox",
         options,
