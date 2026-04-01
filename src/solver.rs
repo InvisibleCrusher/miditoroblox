@@ -1,11 +1,12 @@
 use evdev::KeyCode;
-use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SolverMode {
-    Efficiency, // Least clicks
-    Accuracy,   // Best accuracy
+    Efficiency,
+    Accuracy, // Ignores the max jump
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15,8 +16,6 @@ pub struct KeyMapping {
     pub shift: bool,
     pub ctrl: bool,
 }
-
-// Standard key mappings
 
 #[derive(Deserialize)]
 struct JsonKeyMapping {
@@ -70,26 +69,29 @@ fn parse_key_str(k: &str) -> KeyCode {
 
 pub fn get_available_mappings() -> Vec<KeyMapping> {
     let json_data = include_str!("../mappings.json");
-    let json_mappings: Vec<JsonKeyMapping> = serde_json::from_str(json_data)
-        .expect("Failed to parse mappings.json");
+    let json_mappings: Vec<JsonKeyMapping> =
+        serde_json::from_str(json_data).expect("Failed to parse mappings.json");
 
-    json_mappings.into_iter().map(|m| KeyMapping {
-        midi_note: m.midi_note,
-        key_code: parse_key_str(&m.key),
-        shift: m.shift,
-        ctrl: m.ctrl,
-    }).collect()
+    json_mappings
+        .into_iter()
+        .map(|m| KeyMapping {
+            midi_note: m.midi_note,
+            key_code: parse_key_str(&m.key),
+            shift: m.shift,
+            ctrl: m.ctrl,
+        })
+        .collect()
 }
 
 pub struct Solver {
     // Tracks which physical keys are currently occupied by which MIDI note
     // KeyCode -> List of Active Midi Notes (implied, though really we only care if it's pressed)
     // Holding a key holds the note.
-    pub active_keys: HashMap<KeyCode, HashSet<u8>>, 
-    
+    pub active_keys: HashMap<KeyCode, (u8, Instant)>,
+
     pub shift_active: bool,
     pub ctrl_active: bool,
-    
+
     // The current global transposition offset
     pub current_transpose: i32,
 }
@@ -104,94 +106,81 @@ impl Solver {
         }
     }
 
-    /// Try to find a solution to play `target_note`.
-    /// Returns: Option<(new_transpose_offset, key_mapping_to_use)>
     pub fn solve(
         &self,
         target_note: u8,
         mode: SolverMode,
         max_jump: i32,
-        transpose_range: i32 // 24 means -24 to +24
+        transpose_range: i32,
     ) -> Option<(i32, KeyMapping)> {
         let mappings = get_available_mappings();
 
-        // Potential solution candidates
         let mut best_candidate: Option<(i32, KeyMapping)> = None;
-        let mut min_distance = i32::MAX;
+        let mut best_score = i32::MAX;
 
-        // Find required transposition T = target_note - map.midi_note
         for map in &mappings {
             let required_transpose = target_note as i32 - map.midi_note as i32;
-            
-            // Check if required transpose is within global range limits
+
             if required_transpose.abs() > transpose_range {
                 continue;
             }
 
-            // Check if this physical key is currently pressed
-            let key_busy = self.active_keys.contains_key(&map.key_code) && !self.active_keys[&map.key_code].is_empty();
-            
-            // Check modifiers conflict
-            if !self.is_modifier_safe(map) {
+            let distance = (required_transpose - self.current_transpose).abs();
+
+            if mode == SolverMode::Efficiency && distance > max_jump {
                 continue;
             }
 
-            let mut distance = (required_transpose - self.current_transpose).abs();
-            
-            // Penalty for stealing a busy key (we prefer free keys via transposition)
-            if key_busy {
-                distance += 100; // Equivalent to 100 semitones jump, so we only do it if necessary
+            let mut score = distance * 1000;
+
+            if let Some((held_note, start_time)) = self.active_keys.get(&map.key_code) {
+                // It's a busy key.
+                if *held_note == target_note {
+                    // Retriggering the same physical note is perfectly normal.
+                    score += 100;
+                } else {
+                    // Stealing the key from a different note (polyphony theft).
+                    // The newer the note, the more massively penalized it is.
+                    let age_ms = start_time.elapsed().as_millis() as i32;
+                    let mut theft_penalty = 10000 - (age_ms * 10);
+                    if theft_penalty < 500 {
+                        theft_penalty = 500;
+                    }
+
+                    score += theft_penalty;
+                }
             }
 
-            match mode {
-                SolverMode::Efficiency => {
-                    // Must be within max_jump
-                    if distance <= max_jump {
-                        if distance < min_distance {
-                            min_distance = distance;
-                            best_candidate = Some((required_transpose, *map));
-                        }
-                    }
-                },
-                SolverMode::Accuracy => {
-                    // Just find any valid one. Preference for closer distance?
-                    if distance < min_distance {
-                        min_distance = distance;
-                        best_candidate = Some((required_transpose, *map));
-                    }
-                }
+            // Some penalty for shift/ctrl because i was bored.
+            if self.shift_active != map.shift {
+                score += 5;
+            }
+            if self.ctrl_active != map.ctrl {
+                score += 5;
+            }
+
+            // Prefer mappings closer to the center of the keyboard (midi 60)
+            let center_dist = (map.midi_note as i32 - 60).abs();
+            score += center_dist;
+
+            if score < best_score {
+                best_score = score;
+                best_candidate = Some((required_transpose, *map));
             }
         }
 
         best_candidate
     }
 
-    // Check if activating modifiers for 'new_map' would disrupt currently held notes
-    fn is_modifier_safe(&self, new_map: &KeyMapping) -> bool {
-        // Iterate over all active keys
-        for (_code, notes) in &self.active_keys {
-            if notes.is_empty() { continue; }
-            
-            // Ensure modifier compatibility.
-            // All active keys must share the same Shift/Ctrl requirement as the new candidate
-            // to avoid disrupting currently held notes.
-
-            
-            // We need to know the 'modifier state' of the active keys.
-            // Since we track `shift_active` and `ctrl_active`, we can check against that.
-            
-            if self.shift_active != new_map.shift {
-                return false;
-            }
-            if self.ctrl_active != new_map.ctrl {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub fn register_note_on(&mut self, key: KeyCode, note: u8, transpose: i32, shift: bool, ctrl: bool) {
-        self.active_keys.entry(key).or_insert_with(HashSet::new).insert(note);
+    pub fn register_note_on(
+        &mut self,
+        key: KeyCode,
+        note: u8,
+        transpose: i32,
+        shift: bool,
+        ctrl: bool,
+    ) {
+        self.active_keys.insert(key, (note, Instant::now()));
         self.current_transpose = transpose;
         self.shift_active = shift;
         self.ctrl_active = ctrl;
@@ -200,21 +189,20 @@ impl Solver {
     pub fn register_note_off(&mut self, note: u8) -> Option<KeyCode> {
         // Find the physical key mapped to this MIDI note.
         let mut key_to_release = None;
-        
-        for (code, notes) in self.active_keys.iter_mut() {
-            if notes.contains(&note) {
-                notes.remove(&note);
-                if notes.is_empty() {
-                    key_to_release = Some(*code);
-                }
+
+        for (code, (held_note, _)) in self.active_keys.iter() {
+            if *held_note == note {
+                key_to_release = Some(*code);
                 break;
             }
         }
-        
-        // If no keys left, modifiers are free (conceptually), but we update them lazily only on new press
-        // or we could track if count==0.
-        
-        if self.active_keys.values().all(|s| s.is_empty()) {
+
+        if let Some(code) = key_to_release {
+            self.active_keys.remove(&code);
+        }
+
+        // If no keys left, modifiers are free (conceptually)
+        if self.active_keys.is_empty() {
             self.shift_active = false;
             self.ctrl_active = false;
         }
