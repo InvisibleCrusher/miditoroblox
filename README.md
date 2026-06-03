@@ -1,12 +1,12 @@
 # WARNING!!!
 
-This program automates keyboard inputs, which can lead to unexpected behavior like opening programs or clicking things while it recieves MIDI signals and you have another program focused, please use the right ALT panic mode!!!
+This program automates keyboard inputs, which can lead to unexpected behavior like opening programs or clicking things while it recieves MIDI signals and you have another program focused, please use the right ALT to stop the program from sending key inputs.
 
-This program works only on Linux, and if it doesn't work you might have to run it with sudo. Sometimes there may be problems with fast keys clicking, I suspect that is because of the kernel but I have no idea (works perfectly on my end).
+This program works only on Linux and Windows, if it doesn't work you might have to run it with sudo / administrator privileges.
 
 ## MIDI to Roblox
 
-This Rust Program maps MIDI notes to Roblox keys. It uses /dev/uinput to create a virtual keyboard and uses it to play the notes from a MIDI signal. It features a GUI to control the program.
+This Rust Program maps MIDI notes to Roblox keys. On linux it uses /dev/uinput to create a virtual keyboard and uses it to play the notes from a MIDI signal or file. It features a GUI to control the program.
 
 Building:
 
@@ -18,7 +18,3 @@ Building:
 
 ### 3.
 `cargo run --release`
-
-Usage:
-
-Select a midi device that should be used by the program, then click the "Connect" button.

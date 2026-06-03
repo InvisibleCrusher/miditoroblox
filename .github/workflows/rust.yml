@@ -3,23 +3,55 @@ name: Cargo Build Release
 on:
   push:
     branches: [ "master", "main" ]
+    tags:
+      - "v*"
+      - "*"
   pull_request:
     branches: [ "master", "main" ]
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install System Dependencies
+    - name: Install System Dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libudev-dev
 
     - name: Build Release
       run: cargo build --verbose --release --manifest-path Cargo.toml
+
+    - name: Prepare Release Artifact (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        mv target/release/miditoroblox_rs target/release/miditoroblox-linux
+        echo "ARTIFACT_PATH=target/release/miditoroblox-linux" >> $GITHUB_ENV
+
+    - name: Prepare Release Artifact (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: bash
+      run: |
+        mv target/release/miditoroblox_rs.exe target/release/miditoroblox-windows.exe
+        echo "ARTIFACT_PATH=target/release/miditoroblox-windows.exe" >> $GITHUB_ENV
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ env.ARTIFACT_PATH }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

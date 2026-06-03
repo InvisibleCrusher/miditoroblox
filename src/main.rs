@@ -1,13 +1,76 @@
 use eframe::egui;
-use evdev::{uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode, PropType, UinputAbsSetup};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{self, Duration, SystemTime, UNIX_EPOCH};
 
 use std::thread;
+
+#[cfg(target_os = "linux")]
+use evdev::{uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode, PropType, UinputAbsSetup};
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::ConnectionExt;
+
+#[cfg(target_os = "windows")]
+use solver::KeyCode;
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+pub struct InputEvent {
+    pub type_: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
+#[cfg(target_os = "windows")]
+impl InputEvent {
+    pub fn new(type_: u16, code: u16, value: i32) -> Self {
+        Self { type_, code, value }
+    }
+    pub fn new_now(type_: u16, code: u16, value: i32) -> Self {
+        Self { type_, code, value }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct EventType;
+#[cfg(target_os = "windows")]
+impl EventType {
+    pub const KEY: EventTypeVal = EventTypeVal(1);
+    pub const ABSOLUTE: EventTypeVal = EventTypeVal(3);
+    pub const SYNCHRONIZATION: EventTypeVal = EventTypeVal(0);
+}
+#[cfg(target_os = "windows")]
+#[derive(Copy, Clone)]
+pub struct EventTypeVal(pub u16);
+
+#[cfg(target_os = "windows")]
+pub struct VirtualDevice;
+
+#[cfg(target_os = "windows")]
+impl VirtualDevice {
+    pub fn emit(&self, events: &[InputEvent]) -> std::io::Result<()> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        };
+        for ev in events {
+            if ev.type_ == 1 {
+                let mut input: INPUT = unsafe { std::mem::zeroed() };
+                input.type_ = INPUT_KEYBOARD;
+                let mut ki: KEYBDINPUT = unsafe { std::mem::zeroed() };
+                ki.wVk = ev.code;
+                ki.dwFlags = if ev.value == 0 { KEYEVENTF_KEYUP } else { 0 };
+                input.Anonymous.ki = ki;
+                unsafe {
+                    SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 mod solver;
 use solver::{Solver, SolverMode};
@@ -767,6 +830,7 @@ impl MidiApp {
         app
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_panic_monitor(&self) {
         let shared = self.shared_state.clone();
         thread::spawn(move || {
@@ -866,6 +930,104 @@ impl MidiApp {
         });
     }
 
+    #[cfg(target_os = "windows")]
+    fn spawn_panic_monitor(&self) {
+        let shared = self.shared_state.clone();
+        thread::spawn(move || {
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx,
+                WH_KEYBOARD_LL, VK_RMENU, VK_LMENU,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetMessageW, MSG, HC_ACTION, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, KBDLLHOOKSTRUCT,
+            };
+
+            thread_local! {
+                static SHARED_STATE: std::cell::RefCell<Option<Arc<SharedState>>> = std::cell::RefCell::new(None);
+                static RIGHT_ALT_DOWN: std::cell::Cell<bool> = std::cell::Cell::new(false);
+            }
+
+            SHARED_STATE.with(|s| *s.borrow_mut() = Some(shared.clone()));
+
+            unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+                if code == HC_ACTION as i32 {
+                    let hook_struct = *(lparam as *const KBDLLHOOKSTRUCT);
+                    let vk = hook_struct.vkCode as u16;
+                    let is_down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
+                    
+                    SHARED_STATE.with(|s| {
+                        if let Some(shared_inner) = s.borrow().as_ref() {
+                            // 1. Right ALT Panic
+                            if vk == VK_RMENU && is_down {
+                                if shared_inner.panic_enabled.load(Ordering::Relaxed) {
+                                    shared_inner.panic_active.store(true, Ordering::Relaxed);
+                                    if let Ok(mut state) = shared_inner.device_state.lock() {
+                                        release_all_virtual_keys(&mut state, &shared_inner);
+                                    }
+                                    if let Ok(mut notes) = shared_inner.active_notes.lock() { notes.clear(); }
+                                    if let Ok(mut notes) = shared_inner.active_output_notes.lock() { notes.clear(); }
+                                    if let Ok(ctx_opt) = shared_inner.ui_context.lock() {
+                                        if let Some(ctx) = ctx_opt.as_ref() {
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 2. Left ALT Capture
+                            if vk == VK_LMENU && is_down && shared_inner.drum_support_enabled.load(Ordering::Relaxed) {
+                                let stage = shared_inner.capture_next_left_alt.load(Ordering::Relaxed);
+                                if stage > 0 {
+                                    let pos = shared_inner.mouse_position.lock().ok().and_then(|p| *p);
+                                    if let Some((x, y)) = pos {
+                                        if stage == 1 {
+                                            if let Ok(mut p) = shared_inner.piano_button_position.lock() {
+                                                *p = Some((x, y));
+                                            }
+                                            shared_inner.capture_next_left_alt.store(2, Ordering::Relaxed);
+                                        } else if stage == 2 {
+                                            if let Ok(mut p) = shared_inner.drum_button_position.lock() {
+                                                *p = Some((x, y));
+                                            }
+                                            shared_inner.capture_next_left_alt.store(0, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Right ALT Velocity
+                            if vk == VK_RMENU {
+                                RIGHT_ALT_DOWN.with(|r| r.set(is_down));
+                            }
+
+                            if RIGHT_ALT_DOWN.with(|r| r.get()) && is_down && shared_inner.control_velocity_enabled.load(Ordering::Relaxed) {
+                                if is_velocity_key(vk) {
+                                    if let Ok(mut state) = shared_inner.device_state.lock() {
+                                        let _ = state.device.emit(&[InputEvent::new(1, vk, 1)]);
+                                        let _ = state.device.emit(&[InputEvent::new(1, vk, 0)]);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                CallNextHookEx(0, code, wparam, lparam)
+            }
+
+            unsafe {
+                let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), 0, 0);
+                if hook != 0 {
+                    let mut msg: MSG = std::mem::zeroed();
+                    while GetMessageW(&mut msg, 0, 0, 0) != 0 {
+                        // Standard message loop
+                    }
+                    UnhookWindowsHookEx(hook);
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
     fn spawn_mouse_monitor(&self) {
         let shared = self.shared_state.clone();
         thread::spawn(move || {
@@ -881,6 +1043,24 @@ impl MidiApp {
                         if let Ok(mut pos) = shared.mouse_position.lock() {
                             *pos = Some((i32::from(reply.root_x), i32::from(reply.root_y)));
                         }
+                    }
+                }
+                thread::sleep(time::Duration::from_millis(8));
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_mouse_monitor(&self) {
+        let shared = self.shared_state.clone();
+        thread::spawn(move || {
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCursorPos;
+            use windows_sys::Win32::Foundation::POINT;
+            loop {
+                let mut pt: POINT = unsafe { std::mem::zeroed() };
+                if unsafe { GetCursorPos(&mut pt) } != 0 {
+                    if let Ok(mut pos) = shared.mouse_position.lock() {
+                        *pos = Some((pt.x, pt.y));
                     }
                 }
                 thread::sleep(time::Duration::from_millis(8));
@@ -1532,6 +1712,7 @@ impl eframe::App for MidiApp {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Force X11 backend to ensure Always On Top works (stupid wayland)
     unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
@@ -1580,6 +1761,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Initializing virtual keyboard on Windows...");
+    
+    let device = VirtualDevice;
+
+    let mut options = eframe::NativeOptions::default();
+    options.viewport = egui::ViewportBuilder::default()
+        .with_transparent(true)
+        .with_inner_size([1000.0, 600.0]);
+    eframe::run_native(
+        "Miditoroblox",
+        options,
+        Box::new(|cc| Ok(Box::new(MidiApp::new(cc, device)))),
+    ).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn is_velocity_key(code: u16) -> bool {
     match code {
         c if c >= 2 && c <= 11 => true,  // 1-0
@@ -1588,6 +1789,11 @@ fn is_velocity_key(code: u16) -> bool {
         c if c == 44 || c == 45 || c == 46 => true, // Z, X, C
         _ => false,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn is_velocity_key(code: u16) -> bool {
+    VELOCITY_KEYS.contains(&code)
 }
 
 fn select_solo_toggle(shared: &SharedState, piano: bool) {
@@ -2049,8 +2255,77 @@ fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn move_mouse_and_click(_shared: &SharedState, _x: i32, _y: i32) {}
+#[cfg(target_os = "windows")]
+fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    };
+    let max_axis = 65_535i32;
+    let screen_w = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(0) }; // SM_CXSCREEN
+    let screen_h = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(1) }; // SM_CYSCREEN
+    if screen_w <= 0 || screen_h <= 0 { return; }
+
+    let abs_x = (x.clamp(0, screen_w - 1) * max_axis) / screen_w;
+    let abs_y = (y.clamp(0, screen_h - 1) * max_axis) / screen_h;
+
+    // Move mouse
+    {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
+        mi.dx = abs_x;
+        mi.dy = abs_y;
+        mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        input.Anonymous.mi = mi;
+        unsafe {
+            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    let move_delay = *shared.mouse_move_delay_ms.lock().unwrap_or_else(|e| e.into_inner());
+    if move_delay > 0.0 {
+        thread::sleep(time::Duration::from_secs_f32(move_delay / 1000.0));
+    }
+
+    // Press down
+    {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
+        mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        input.Anonymous.mi = mi;
+        unsafe {
+            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    let hold_delay = *shared.mouse_click_hold_ms.lock().unwrap_or_else(|e| e.into_inner());
+    if hold_delay > 0.0 {
+        thread::sleep(time::Duration::from_secs_f32(hold_delay / 1000.0));
+    }
+
+    // Release up
+    {
+        let mut input: INPUT = unsafe { std::mem::zeroed() };
+        input.type_ = INPUT_MOUSE;
+        let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
+        mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        input.Anonymous.mi = mi;
+        unsafe {
+            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    let after_release_delay = *shared.mouse_after_release_ms.lock().unwrap_or_else(|e| e.into_inner());
+    if after_release_delay > 0.0 {
+        thread::sleep(time::Duration::from_secs_f32(after_release_delay / 1000.0));
+    }
+
+    if let Ok(mut pos) = shared.mouse_position.lock() {
+        *pos = Some((x, y));
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn build_mouse_device() -> std::io::Result<VirtualDevice> {
@@ -2073,7 +2348,12 @@ fn build_mouse_device() -> std::io::Result<VirtualDevice> {
         .build()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn build_mouse_device() -> std::io::Result<VirtualDevice> {
+    Ok(VirtualDevice)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn build_mouse_device() -> std::io::Result<VirtualDevice> {
     Err(std::io::Error::new(std::io::ErrorKind::Other, "mouse uinput only supported on linux"))
 }
@@ -2085,6 +2365,18 @@ fn get_screen_size() -> Option<(i32, i32)> {
     Some((i32::from(screen.width_in_pixels), i32::from(screen.height_in_pixels)))
 }
 
+#[cfg(target_os = "windows")]
+fn get_screen_size() -> Option<(i32, i32)> {
+    let w = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(0) }; // SM_CXSCREEN
+    let h = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(1) }; // SM_CYSCREEN
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
 const VELOCITY_KEYS: [u16; 32] = [
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, // 1-0
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, // Q-P
@@ -2092,23 +2384,32 @@ const VELOCITY_KEYS: [u16; 32] = [
     44, 45, 46 // Z, X, C
 ];
 
+#[cfg(target_os = "windows")]
+const VELOCITY_KEYS: [u16; 32] = [
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, // 1-0
+    0x51, 0x57, 0x45, 0x52, 0x54, 0x59, 0x55, 0x49, 0x4F, 0x50, // Q-P
+    0x41, 0x53, 0x44, 0x46, 0x47, 0x48, 0x4A, 0x4B, 0x4C, // A-L
+    0x5A, 0x58, 0x43 // Z, X, C
+];
+
 fn release_all_virtual_keys(state: &mut DeviceState, shared_state: &SharedState) {
     let keys = state.solver.reset_keys();
     for k in keys {
-        let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, k.code(), 0)]);
+        let _ = state.device.emit(&[InputEvent::new(1, k.code(), 0)]);
     }
     let _ = state.device.emit(&[
-        InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.code(), 0),
-        InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0),
-        InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTALT.code(), 0),
+        InputEvent::new(1, KeyCode::KEY_LEFTSHIFT.code(), 0),
+        InputEvent::new(1, KeyCode::KEY_LEFTCTRL.code(), 0),
+        InputEvent::new(1, KeyCode::KEY_LEFTALT.code(), 0),
     ]);
     for map in solver::get_available_mappings() {
-        let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, map.key_code.code(), 0)]);
+        let _ = state.device.emit(&[InputEvent::new(1, map.key_code.code(), 0)]);
     }
     for vk in VELOCITY_KEYS {
-        let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, vk, 0)]);
+        let _ = state.device.emit(&[InputEvent::new(1, vk, 0)]);
     }
-    let _ = state.device.emit(&[InputEvent::new(EventType::KEY.0, KeyCode::KEY_APOSTROPHE.code(), 0)]);
+    let _ = state.device.emit(&[InputEvent::new(1, KeyCode::KEY_APOSTROPHE.code(), 0)]);
+    #[cfg(target_os = "linux")]
     let _ = state.device.emit(&[InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0)]);
     shared_state.last_sent_velocity_key.store(0, Ordering::Relaxed);
 }

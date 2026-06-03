@@ -1,4 +1,63 @@
-use evdev::KeyCode;
+#[cfg(target_os = "linux")]
+pub use evdev::KeyCode;
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct KeyCode(pub u16);
+
+#[cfg(target_os = "windows")]
+impl KeyCode {
+    pub const KEY_RESERVED: KeyCode = KeyCode(0);
+    pub const KEY_1: KeyCode = KeyCode(0x31);
+    pub const KEY_2: KeyCode = KeyCode(0x32);
+    pub const KEY_3: KeyCode = KeyCode(0x33);
+    pub const KEY_4: KeyCode = KeyCode(0x34);
+    pub const KEY_5: KeyCode = KeyCode(0x35);
+    pub const KEY_6: KeyCode = KeyCode(0x36);
+    pub const KEY_7: KeyCode = KeyCode(0x37);
+    pub const KEY_8: KeyCode = KeyCode(0x38);
+    pub const KEY_9: KeyCode = KeyCode(0x39);
+    pub const KEY_0: KeyCode = KeyCode(0x30);
+    pub const KEY_Q: KeyCode = KeyCode(0x51);
+    pub const KEY_W: KeyCode = KeyCode(0x57);
+    pub const KEY_E: KeyCode = KeyCode(0x45);
+    pub const KEY_R: KeyCode = KeyCode(0x52);
+    pub const KEY_T: KeyCode = KeyCode(0x54);
+    pub const KEY_Y: KeyCode = KeyCode(0x59);
+    pub const KEY_U: KeyCode = KeyCode(0x55);
+    pub const KEY_I: KeyCode = KeyCode(0x49);
+    pub const KEY_O: KeyCode = KeyCode(0x4F);
+    pub const KEY_P: KeyCode = KeyCode(0x50);
+    pub const KEY_A: KeyCode = KeyCode(0x41);
+    pub const KEY_S: KeyCode = KeyCode(0x53);
+    pub const KEY_D: KeyCode = KeyCode(0x44);
+    pub const KEY_F: KeyCode = KeyCode(0x46);
+    pub const KEY_G: KeyCode = KeyCode(0x47);
+    pub const KEY_H: KeyCode = KeyCode(0x48);
+    pub const KEY_J: KeyCode = KeyCode(0x4A);
+    pub const KEY_K: KeyCode = KeyCode(0x4B);
+    pub const KEY_L: KeyCode = KeyCode(0x4C);
+    pub const KEY_Z: KeyCode = KeyCode(0x5A);
+    pub const KEY_X: KeyCode = KeyCode(0x58);
+    pub const KEY_C: KeyCode = KeyCode(0x43);
+    pub const KEY_V: KeyCode = KeyCode(0x56);
+    pub const KEY_B: KeyCode = KeyCode(0x42);
+    pub const KEY_N: KeyCode = KeyCode(0x4E);
+    pub const KEY_M: KeyCode = KeyCode(0x4D);
+
+    pub const KEY_LEFTSHIFT: KeyCode = KeyCode(0xA0); // VK_LSHIFT
+    pub const KEY_LEFTCTRL: KeyCode = KeyCode(0xA2);  // VK_LCONTROL
+    pub const KEY_LEFTALT: KeyCode = KeyCode(0xA4);   // VK_LMENU
+    pub const KEY_RIGHTALT: KeyCode = KeyCode(0xA5);  // VK_RMENU
+    pub const KEY_UP: KeyCode = KeyCode(0x26);        // VK_UP
+    pub const KEY_DOWN: KeyCode = KeyCode(0x28);      // VK_DOWN
+    pub const KEY_APOSTROPHE: KeyCode = KeyCode(0xDE); // VK_OEM_7
+
+    pub fn code(&self) -> u16 {
+        self.0
+    }
+}
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Instant;
