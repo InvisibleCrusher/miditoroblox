@@ -113,6 +113,17 @@ impl Solver {
         max_jump: i32,
         transpose_range: i32,
     ) -> Option<(i32, KeyMapping)> {
+        self.solve_bounded(target_note, mode, max_jump, -transpose_range, transpose_range)
+    }
+
+    pub fn solve_bounded(
+        &self,
+        target_note: u8,
+        mode: SolverMode,
+        max_jump: i32,
+        min_transpose: i32,
+        max_transpose: i32,
+    ) -> Option<(i32, KeyMapping)> {
         let mappings = get_available_mappings();
 
         let mut best_candidate: Option<(i32, KeyMapping)> = None;
@@ -121,7 +132,7 @@ impl Solver {
         for map in &mappings {
             let required_transpose = target_note as i32 - map.midi_note as i32;
 
-            if required_transpose.abs() > transpose_range {
+            if required_transpose < min_transpose || required_transpose > max_transpose {
                 continue;
             }
 
@@ -151,7 +162,7 @@ impl Solver {
                 }
             }
 
-            // Some penalty for shift/ctrl because i was bored.
+            // Small penalty for shift/ctrl modifications.
             if self.shift_active != map.shift {
                 score += 5;
             }

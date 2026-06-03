@@ -9,3 +9,5 @@ eframe = "0.31"
 midir = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
+x11rb = "0.13"
+midly = "0.5"
