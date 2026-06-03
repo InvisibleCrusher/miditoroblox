@@ -58,7 +58,7 @@ impl VirtualDevice {
         for ev in events {
             if ev.type_ == 1 {
                 let mut input: INPUT = unsafe { std::mem::zeroed() };
-                input.type_ = INPUT_KEYBOARD;
+                input.r#type = INPUT_KEYBOARD;
                 let mut ki: KEYBDINPUT = unsafe { std::mem::zeroed() };
                 ki.wVk = ev.code;
                 ki.dwFlags = if ev.value == 0 { KEYEVENTF_KEYUP } else { 0 };
@@ -935,11 +935,12 @@ impl MidiApp {
         let shared = self.shared_state.clone();
         thread::spawn(move || {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-                SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx,
-                WH_KEYBOARD_LL, VK_RMENU, VK_LMENU,
+                VK_RMENU, VK_LMENU,
             };
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetMessageW, MSG, HC_ACTION, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, KBDLLHOOKSTRUCT,
+                SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx,
+                WH_KEYBOARD_LL, GetMessageW, MSG, HC_ACTION, WM_KEYDOWN,
+                WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, KBDLLHOOKSTRUCT,
             };
 
             thread_local! {
@@ -1054,7 +1055,7 @@ impl MidiApp {
     fn spawn_mouse_monitor(&self) {
         let shared = self.shared_state.clone();
         thread::spawn(move || {
-            use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCursorPos;
+            use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
             use windows_sys::Win32::Foundation::POINT;
             loop {
                 let mut pt: POINT = unsafe { std::mem::zeroed() };
@@ -2261,9 +2262,10 @@ fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
         SendInput, INPUT, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE,
         MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
     let max_axis = 65_535i32;
-    let screen_w = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(0) }; // SM_CXSCREEN
-    let screen_h = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(1) }; // SM_CYSCREEN
+    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     if screen_w <= 0 || screen_h <= 0 { return; }
 
     let abs_x = (x.clamp(0, screen_w - 1) * max_axis) / screen_w;
@@ -2272,7 +2274,7 @@ fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
     // Move mouse
     {
         let mut input: INPUT = unsafe { std::mem::zeroed() };
-        input.type_ = INPUT_MOUSE;
+        input.r#type = INPUT_MOUSE;
         let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
         mi.dx = abs_x;
         mi.dy = abs_y;
@@ -2291,7 +2293,7 @@ fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
     // Press down
     {
         let mut input: INPUT = unsafe { std::mem::zeroed() };
-        input.type_ = INPUT_MOUSE;
+        input.r#type = INPUT_MOUSE;
         let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
         mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
         input.Anonymous.mi = mi;
@@ -2308,7 +2310,7 @@ fn move_mouse_and_click(shared: &SharedState, x: i32, y: i32) {
     // Release up
     {
         let mut input: INPUT = unsafe { std::mem::zeroed() };
-        input.type_ = INPUT_MOUSE;
+        input.r#type = INPUT_MOUSE;
         let mut mi: MOUSEINPUT = unsafe { std::mem::zeroed() };
         mi.dwFlags = MOUSEEVENTF_LEFTUP;
         input.Anonymous.mi = mi;
@@ -2367,8 +2369,9 @@ fn get_screen_size() -> Option<(i32, i32)> {
 
 #[cfg(target_os = "windows")]
 fn get_screen_size() -> Option<(i32, i32)> {
-    let w = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(0) }; // SM_CXSCREEN
-    let h = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetSystemMetrics(1) }; // SM_CYSCREEN
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     if w > 0 && h > 0 {
         Some((w, h))
     } else {
