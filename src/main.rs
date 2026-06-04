@@ -53,22 +53,110 @@ pub struct VirtualDevice;
 impl VirtualDevice {
     pub fn emit(&self, events: &[InputEvent]) -> std::io::Result<()> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+            INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
         };
         for ev in events {
             if ev.type_ == 1 {
+                let sc = vk_to_scan(ev.code);
+                if sc == 0 { continue; }
+                let mut flags = KEYEVENTF_SCANCODE;
+                if ev.value == 0 { flags |= KEYEVENTF_KEYUP; }
+                if vk_is_extended(ev.code) { flags |= KEYEVENTF_EXTENDEDKEY; }
                 let mut input: INPUT = unsafe { std::mem::zeroed() };
                 input.r#type = INPUT_KEYBOARD;
                 let mut ki: KEYBDINPUT = unsafe { std::mem::zeroed() };
-                ki.wVk = ev.code;
-                ki.dwFlags = if ev.value == 0 { KEYEVENTF_KEYUP } else { 0 };
+                ki.wScan = sc;
+                ki.dwFlags = flags;
                 input.Anonymous.ki = ki;
-                unsafe {
-                    SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-                }
+                nt_send_input(&[input]);
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn vk_to_scan(vk: u16) -> u16 {
+    match vk {
+        0x41 => 0x1E, 0x42 => 0x30, 0x43 => 0x2E, 0x44 => 0x20, 0x45 => 0x12,
+        0x46 => 0x21, 0x47 => 0x22, 0x48 => 0x23, 0x49 => 0x17, 0x4A => 0x24,
+        0x4B => 0x25, 0x4C => 0x26, 0x4D => 0x32, 0x4E => 0x31, 0x4F => 0x18,
+        0x50 => 0x19, 0x51 => 0x10, 0x52 => 0x13, 0x53 => 0x1F, 0x54 => 0x14,
+        0x55 => 0x16, 0x56 => 0x2F, 0x57 => 0x11, 0x58 => 0x2D, 0x59 => 0x15,
+        0x5A => 0x2C,
+        0x30 => 0x0B, 0x31 => 0x02, 0x32 => 0x03, 0x33 => 0x04, 0x34 => 0x05,
+        0x35 => 0x06, 0x36 => 0x07, 0x37 => 0x08, 0x38 => 0x09, 0x39 => 0x0A,
+        0xA0 => 0x2A, // VK_LSHIFT
+        0xA1 => 0x36, // VK_RSHIFT
+        0xA2 => 0x1D, // VK_LCONTROL
+        0xA4 => 0x38, // VK_LMENU
+        0x26 => 0x48, // VK_UP
+        0x28 => 0x50, // VK_DOWN
+        0x25 => 0x4B, // VK_LEFT
+        0x27 => 0x4D, // VK_RIGHT
+        0xDE => 0x28, // VK_OEM_7 (apostrophe/sustain)
+        0x20 => 0x39, // Space
+        _ => 0,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn vk_is_extended(vk: u16) -> bool {
+    matches!(vk, 0x26 | 0x28 | 0x25 | 0x27 | 0xA2 | 0xA3 | 0xA4 | 0xA5)
+}
+
+#[cfg(target_os = "windows")]
+fn nt_send_input(inputs: &[windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT]) {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT;
+    type NtFn = unsafe extern "system" fn(u32, *const INPUT, i32) -> u32;
+    static NT_FN: OnceLock<NtFn> = OnceLock::new();
+    let f = NT_FN.get_or_init(|| unsafe { build_nt_send_input_stub() });
+    unsafe { f(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn build_nt_send_input_stub() -> unsafe extern "system" fn(u32, *const windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT, i32) -> u32 {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, VirtualProtect,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    };
+
+    let candidates: &[&[u8]] = &[b"win32u.dll\0", b"user32.dll\0", b"ntdll.dll\0"];
+    let name = b"NtUserSendInput\0";
+    let mut syscall_num: u32 = 0;
+
+    'outer: for dll in candidates {
+        let hmod = unsafe { GetModuleHandleA(dll.as_ptr()) };
+        if hmod == 0 { continue; }
+        if let Some(proc) = unsafe { GetProcAddress(hmod, name.as_ptr()) } {
+            let b = proc as *const u8;
+            // x64 syscall stub: 4C 8B D1  B8 <num>
+            if unsafe { *b == 0x4C && *b.add(1) == 0x8B && *b.add(2) == 0xD1 } {
+                syscall_num = unsafe { *(b.add(4) as *const u32) };
+                break 'outer;
+            }
+        }
+    }
+
+    assert!(syscall_num != 0, "NtUserSendInput syscall not found");
+
+    let mem = unsafe { VirtualAlloc(std::ptr::null(), 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
+    assert!(!mem.is_null(), "VirtualAlloc failed");
+
+    unsafe {
+        let c = mem as *mut u8;
+        *c        = 0x4C; *c.add(1) = 0x8B; *c.add(2) = 0xD1; // mov r10, rcx
+        *c.add(3) = 0xB8;                                        // mov eax, imm32
+        *(c.add(4) as *mut u32) = syscall_num;
+        *c.add(8)  = 0x0F; *c.add(9) = 0x05;                    // syscall
+        *c.add(10) = 0xC3;                                       // ret
+
+        let mut old = 0u32;
+        VirtualProtect(mem, 16, PAGE_EXECUTE_READ, &mut old);
+
+        std::mem::transmute(mem)
     }
 }
 
