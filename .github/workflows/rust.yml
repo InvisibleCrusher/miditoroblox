@@ -31,20 +31,33 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libudev-dev
 
+    - uses: dtolnay/rust-toolchain@1.99.1
+      with:
+        components: rustfmt, clippy
+
+    - name: Check Formatting
+      run: cargo fmt --all -- --check
+
+    - name: Lint
+      run: cargo clippy --locked --all-targets -- -D warnings
+
+    - name: Test
+      run: cargo test --locked
+
     - name: Build Release
-      run: cargo build --verbose --release --manifest-path Cargo.toml
+      run: cargo build --locked --verbose --release --manifest-path Cargo.toml
 
     - name: Prepare Release Artifact (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        mv target/release/miditoroblox_rs target/release/miditoroblox-linux
+        mv target/release/miditoroblox target/release/miditoroblox-linux
         echo "ARTIFACT_PATH=target/release/miditoroblox-linux" >> $GITHUB_ENV
 
     - name: Prepare Release Artifact (Windows)
       if: matrix.os == 'windows-latest'
       shell: bash
       run: |
-        mv target/release/miditoroblox_rs.exe target/release/miditoroblox-windows.exe
+        mv target/release/miditoroblox.exe target/release/miditoroblox-windows.exe
         echo "ARTIFACT_PATH=target/release/miditoroblox-windows.exe" >> $GITHUB_ENV
 
     - name: Create GitHub Release
