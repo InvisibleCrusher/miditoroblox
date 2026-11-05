@@ -1,6 +1,6 @@
 # MIDI to Roblox
 
-A Rust desktop app that converts a live MIDI input or MIDI file into keyboard notes for Roblox. Supports Linux and Windows.
+A Rust desktop app that converts a live MIDI input or MIDI file into keyboard notes for Roblox. Supports Linux and Windows. (AI was used in development)
 
 The app sends keyboard input to the focused window. Right Alt stops output when **ALT to Panic** is enabled; use **Continue** to clear panic before playing again. Focusing this app pauses file playback and releases held keys. Switching back to Roblox resumes after a 200 ms delay so the first notes reach the game after the window switch. Live input uses the same focus delay.
 
